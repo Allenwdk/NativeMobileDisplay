@@ -1,5 +1,7 @@
 # NativeMobileDisplay
 
-Mobile display and GPU scanout hand-off.
+Mobile display driver and GPU scanout hand-off. Validates swaps, retires frames and drives the firmware framebuffer.
 
-Maintained as an independent module and included by [UniXNU](https://github.com/UniXNU/UniXNU) at `drivers/NativeMobileDisplay`.
+Current state: the CPU and GPU scanout paths work. Display vblank is not implemented.
+
+Linked into XNU by `unixnu build kernel`.
