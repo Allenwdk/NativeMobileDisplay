@@ -14,6 +14,7 @@ extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,v
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
 extern "C" void native_legacy_registration_observed(IOService *);
+extern "C" void native_legacy_swap_stage(unsigned);
 extern "C" void native_legacy_client_enter(task_t,uint32_t);
 extern "C" void native_legacy_client_observed(IOReturn,IOUserClient *);
 extern "C" void native_legacy_pm_observed(unsigned,IOReturn,unsigned long);
@@ -189,6 +190,7 @@ public:
         }
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
+            native_legacy_swap_stage(1);
             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;return;
         }
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
