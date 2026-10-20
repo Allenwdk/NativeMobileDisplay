@@ -157,6 +157,11 @@ public:
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display; the GPU path needs that as much
+        // as the CPU copy (int-093: accepted swaps were GPU-copied under a page that kept drawing).
+        if(!gpuBypass) {
+            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+        }
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;return;
