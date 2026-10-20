@@ -130,7 +130,21 @@ public:
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
+    // A swap the client submitted while the previous one was still on its way (transferred) is not kicked by the family again: without the
+    // re-kick after each retirement it waited for the next submission (int-143: every offer came one frame late, a still screen showed the
+    // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
+    bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        if(kicking){rekick=true;return;}
+        kicking=true;
+        do {
+            rekick=false;
+            kickOnce();
+            gpuBypass=false;
+        } while(rekick && !transferred);
+        kicking=false;
+    }
+    void kickOnce() {
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
@@ -257,7 +271,7 @@ public:
             finishTransfer(request,true);return;
         }
         native_legacy_gpu_fallback_observed(status);
-        transferred=false;gpuBypass=true;kickSwapQueue();gpuBypass=false;
+        transferred=false;gpuBypass=true;kickSwapQueue();
     }
     // Separately gated retirement after a real scanout store, shared by copied and blank frames.
     void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
@@ -279,6 +293,7 @@ public:
             // single pending frame. Keep the latch set while completion can
             // reenter this method, and whenever retirement remains disabled.
             transferred=false;
+            kickSwapQueue();
         }
     }
     IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
