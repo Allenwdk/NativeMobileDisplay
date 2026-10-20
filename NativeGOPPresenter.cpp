@@ -13,6 +13,9 @@ extern "C" {
 volatile uint32_t native_gop_ready,native_gop_failures;
 volatile uint64_t native_gop_transfers,native_gop_bytes,native_gop_physical,native_gop_virtual;
 volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gpu_failures,native_gop_gpu_abandoned;
+/* waitSwap: [0] calls, [1] timeouts, [2] the requested timeout of the last call (ms), [3] time the last timed-out call really waited (ns), [4] the shortest
+ * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
+volatile uint64_t native_gop_wait_stats[7];
 IOService *native_gop_presenter_create(void);
 bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
@@ -141,10 +144,20 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     if(!gpuMode)return kIOReturnUnsupported;
     if(timeoutMs>1000)timeoutMs=1000;
     uint64_t deadline;clock_interval_to_deadline((uint32_t)timeoutMs,kMillisecondScale,&deadline);
+    const uint64_t began=mach_absolute_time();
+    native_gop_wait_stats[0]=native_gop_wait_stats[0]+1;native_gop_wait_stats[2]=timeoutMs;
     IOLockLock(gate);
     gpuClient=true;
     while(online && (!swap.offered || swap.delivered)) {
-        if(IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {IOLockUnlock(gate);return kIOReturnTimeout;}
+        if(IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
+            IOLockUnlock(gate);
+            uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
+            native_gop_wait_stats[1]=native_gop_wait_stats[1]+1;native_gop_wait_stats[3]=ns;
+            if(!native_gop_wait_stats[4] || ns<native_gop_wait_stats[4])native_gop_wait_stats[4]=ns;
+            if(ns>native_gop_wait_stats[5])native_gop_wait_stats[5]=ns;
+            native_gop_wait_stats[6]=native_gop_wait_stats[6]+ns;
+            return kIOReturnTimeout;
+        }
     }
     if(!online) {IOLockUnlock(gate);return kIOReturnNotReady;}
     swap.delivered=true;
