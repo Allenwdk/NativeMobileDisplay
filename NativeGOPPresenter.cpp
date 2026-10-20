@@ -15,10 +15,13 @@ volatile uint64_t native_gop_transfers,native_gop_bytes,native_gop_physical,nati
 volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gpu_failures,native_gop_gpu_abandoned;
 IOService *native_gop_presenter_create(void);
 bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
 void native_legacy_gpu_complete(void *display,int status);
 }
 class NativeGOPClient;
+class NativeGOPPresenter;
+static NativeGOPPresenter *gHandoff;   // the presenter in GPU mode: the hand-off entry points below reach it without the registry
 class NativeGOPPresenter : public IOService {
     OSDeclareDefaultStructors(NativeGOPPresenter)
     friend class NativeGOPClient;
@@ -27,6 +30,7 @@ class NativeGOPPresenter : public IOService {
     IOService *owner=nullptr;
     NGPMode mode={};
     bool online=false;
+    IOService *memorySource=nullptr;
     // GPU hand-off (sheng-fb-gpu=1): one offered frame at a time, from the display driver to the privileged client.
     bool gpuMode=false,gpuClient=false;
     struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
@@ -36,6 +40,9 @@ class NativeGOPPresenter : public IOService {
     IOReturn completeSwap(uint64_t sequence,int status);
     void abandonSwap();
 public:
+    void setMemorySource(IOService *source) {memorySource=source;}
+    static IOReturn handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize);
+    static IOMemoryDescriptor *handoffMemory();
     bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 private:
     IOReturn transfer(task_t,const NGPPresent &,NGPTransfer *);
@@ -75,16 +82,19 @@ bool NativeGOPPresenter::start(IOService *provider) {
     if(PE_current_console(&video) || !video.v_baseAddr || !video.v_width || !video.v_height ||
        video.v_width>16384 || video.v_height>16384 || video.v_depth!=32 || video.v_rotate ||
        video.v_rowBytes<video.v_width*4 || video.v_rowBytes>UINT64_MAX/video.v_height)return false;
-    mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+    // The hand-off presenter is attached away from the display subsystem's node (the original display code enumerates that node's children),
+    // so the framebuffer memory comes from the node it names instead of its provider.
+    mapping=(memorySource?memorySource:provider)->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
     if(!mapping || !mapping->getVirtualAddress() || mapping->getPhysicalAddress()!=video.v_baseAddr ||
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
     {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
     mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
-    online=true;native_gop_ready=1;registerService();return true;
+    online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
 }
 void NativeGOPPresenter::stop(IOService *provider) {
+    if(gHandoff==this)gHandoff=nullptr;
     if(gate)IOLockLock(gate);online=false;native_gop_ready=0;if(gate){IOLockWakeup(gate,&swap,false);IOLockUnlock(gate);}
     abandonSwap();
     IOService::stop(provider);
@@ -175,10 +185,49 @@ void NativeGOPPresenter::abandonSwap() {
     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
     native_legacy_gpu_complete(done.display,kIOReturnAborted);
 }
+extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub) {
+    if(NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter))p->setMemorySource(nub);
+}
 extern "C" bool native_gop_gpu_offer(IOService *presenter,void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
     NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter);
     return p && p->offer(display,memory,stride,width,height);
 }
+// Entry points for the GPU client that reaches the hand-off through an already admitted connection (the Adreno accelerator's user client, which
+// the original sandbox profiles allow where they do not allow this service): op 0 mode, 2 wait for a frame, 3 complete it (the NGP_METHOD_*
+// numbers). Same checks as the service's own methods; sizes are the wire records'.
+IOReturn NativeGOPPresenter::handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize) {
+    NativeGOPPresenter *p=gHandoff;
+    if(!p || !p->gpuMode || !p->online)return kIOReturnNotReady;
+    switch(op) {
+    case NGP_METHOD_MODE:
+        if(inSize || !out || outSize!=sizeof(NGPMode))return kIOReturnBadArgument;
+        memcpy(out,&p->mode,sizeof(NGPMode));return kIOReturnSuccess;
+    case NGP_METHOD_WAIT_SWAP: {
+        if(!in || inSize!=sizeof(NGPWait) || !out || outSize!=sizeof(NGPSwap))return kIOReturnBadArgument;
+        NGPWait q={};NGPSwap swap={};memcpy(&q,in,sizeof(q));
+        IOReturn status=p->waitSwap(task,q.timeout_ms,&swap);
+        if(status==kIOReturnSuccess)memcpy(out,&swap,sizeof(swap));return status;
+    }
+    case NGP_METHOD_COMPLETE_SWAP: {
+        if(!in || inSize!=sizeof(NGPComplete) || outSize)return kIOReturnBadArgument;
+        NGPComplete q={};memcpy(&q,in,sizeof(q));
+        return p->completeSwap(q.sequence,(int)q.status);
+    }
+    default:return kIOReturnUnsupported;
+    }
+}
+// The scanout as a writable, retained descriptor (GPU mode only); the caller maps it into its task.
+IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
+    NativeGOPPresenter *p=gHandoff;
+    if(!p || !p->gpuMode || !p->online || !p->mapping)return nullptr;
+    IOMemoryDescriptor *memory=p->mapping->getMemoryDescriptor();
+    if(memory)memory->retain();
+    return memory;
+}
+extern "C" IOReturn native_gop_handoff_call(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize) {
+    return NativeGOPPresenter::handoffCall(op,task,in,inSize,out,outSize);
+}
+extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void) {return NativeGOPPresenter::handoffMemory();}
 IOReturn NativeGOPPresenter::newUserClient(task_t task,void *security,UInt32 type,OSDictionary *properties,IOUserClient **out) {
     if(!out || type)return kIOReturnBadArgument;
     *out=nullptr;NativeGOPClient *client=new NativeGOPClient;if(!client)return kIOReturnNoMemory;
