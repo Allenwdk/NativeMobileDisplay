@@ -24,6 +24,8 @@ extern "C" uint32_t native_legacy_surface_format(OSObject *),native_legacy_surfa
 extern "C" void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy);
 extern "C" void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *counts,uint64_t other);
 extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void *,const void *);
+// The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
+extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
 extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
@@ -143,7 +145,7 @@ public:
         uint64_t sourceStride=native_legacy_surface_stride(surface);
         uint64_t allocation=native_legacy_surface_allocation(surface);
         if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
-           native_legacy_surface_width(surface)!=width || native_legacy_surface_height(surface)!=height ||
+           native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
            native_legacy_surface_format(surface)!=0x42475241 || native_legacy_surface_planes(surface) ||
            PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
            video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
@@ -272,12 +274,18 @@ public:
                 if(width && height && rectangles && options && word(816)==width && word(820)==height) {
                     reason=4;
                     IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
-                    if(native_legacy_surface_width(surface)==width && native_legacy_surface_height(surface)==height &&
+                    // A surface larger than the display (rows or lines padded to the GPU's alignment) is accepted: only the visible rectangle,
+                    // which the request's rectangles already name as the whole display, is copied.
+                    if(native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height &&
                        native_legacy_surface_format(surface)==0x42475241 && !native_legacy_surface_planes(surface) &&
                        memory && memory->metaCast("IOMemoryDescriptor") &&
                        native_legacy_surface_bounds(width,height,native_legacy_surface_stride(surface),
                            native_legacy_surface_allocation(surface),memory->getLength())) {
                         reason=0;accepted=true;
+                    } else {
+                        native_legacy_surface_rejected(native_legacy_surface_width(surface),native_legacy_surface_height(surface),
+                            native_legacy_surface_format(surface),native_legacy_surface_planes(surface),native_legacy_surface_stride(surface),
+                            native_legacy_surface_allocation(surface),memory?memory->getLength():0);
                     }
                 }
             }
