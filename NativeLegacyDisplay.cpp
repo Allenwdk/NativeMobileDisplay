@@ -47,7 +47,21 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
-    const OriginalLegacySwapRequest *validatedRequest=nullptr;
+    // Every request the validator accepted and the family has not retired yet. A client may submit swap N+1 while swap N is still on the GPU
+    // (int-131: swap 3 was validated during swap 2's GPU copy and one remembered pointer lost swap 2, which then never retired and left
+    // every wait on it busy), so more than one can be pending.
+    const OriginalLegacySwapRequest *validated[8]={};
+    bool isValidated(const OriginalLegacySwapRequest *request) const {
+        if(!request)return false;
+        for(auto entry: validated)if(entry==request)return true;
+        return false;
+    }
+    void removeValidated(const OriginalLegacySwapRequest *request) {for(auto &entry: validated)if(entry==request)entry=nullptr;}
+    void addValidated(const OriginalLegacySwapRequest *request) {
+        if(isValidated(request))return;
+        for(auto &entry: validated)if(!entry){entry=request;return;}
+        validated[0]=request;
+    }
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
@@ -63,12 +77,23 @@ public:
     }
     void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
-        transferred=false;validatedRequest=nullptr;gpuRequest=nullptr;
+        transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
+    // The panel is already lit by the firmware's GOP framebuffer, which is the one thing the original code's power-state word (display+5840,
+    // the "powered" half of the state pair next to +5836) is meant to say; the platform subclass that normally writes it is not part of this
+    // port, so without it the user client's wait (selector 6) answers kIOReturnBusy forever and the compositor never presents. This is the
+    // original state setter (virtual 354, the one the original code calls with this same request shape) with only the powered word named.
+    void announcePoweredByFirmware() {
+        struct StateRequest {uint32_t skipRequested,requested,skipPowered,powered;uint8_t changed;uint8_t pad[11];} request={1,0,0,1,1,{}};
+        typedef int (*Setter)(void *,StateRequest *,bool);
+        Setter setter=reinterpret_cast<Setter *>(*reinterpret_cast<void **>(this))[354];
+        setter(this,&request,false);
+    }
     bool start(IOService *provider) override {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
+        if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
         unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
@@ -108,7 +133,7 @@ public:
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
-        if(!request || request!=validatedRequest)return;
+        if(!request || !isValidated(request))return;
         // This bounded first-frame transfer preserves the original queue's
         // resource ownership. Separately gated retirement follows the copy;
         // neither path signals a hardware fence, announces a vblank or
@@ -223,7 +248,7 @@ public:
     // The GPU client reported its copy (status 0) or lost it. Success retires the swap like a finished copy; anything else uses the CPU copy.
     void finishGpuSwap(int status) {
         const OriginalLegacySwapRequest *request=gpuRequest;
-        if(!request || request!=validatedRequest)return;
+        if(!request)return;
         gpuRequest=nullptr;
         if(status==0) {
             native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
@@ -244,7 +269,7 @@ public:
             // vblank or hardware fence. Producer completion must precede
             // submission; this does not implement asynchronous GPU sync.
             if(!activateOnlyPendingSwap(request))return;
-            validatedRequest=nullptr;
+            removeValidated(request);
             IOMobileFramebufferLegacy::completeCurrentSwap();
             native_legacy_retirement_observed(this);
             // The unchanged family has retired this generation and released
@@ -310,7 +335,7 @@ public:
                 reason=5;accepted=true;
             }
         }
-        validatedRequest=accepted?request:nullptr;
+        if(accepted)addValidated(request);else removeValidated(request);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;
     }
     // The original slot-188 caller passes a uint32_t output and consumes an
