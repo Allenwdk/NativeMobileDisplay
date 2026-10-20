@@ -5,6 +5,7 @@
 #include "OriginalLegacyFramebufferABI.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOWorkLoop.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -27,6 +28,10 @@ extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
 extern "C" void native_legacy_retirement_observed(IOService *);
+// GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
+// client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
+extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+extern "C" void native_legacy_gpu_fallback_observed(int status);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -36,10 +41,22 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool logicalPM=false;
     bool transferred=false;
     const OriginalLegacySwapRequest *validatedRequest=nullptr;
+    const OriginalLegacySwapRequest *gpuRequest=nullptr;
+    uint64_t gpuLength=0;
+    bool gpuBypass=false;
 public:
+    // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
+    void gpuComplete(int status) {
+        struct Args {NativeLegacyDisplay *display;int status;} args={this,status};
+        IOWorkLoop *loop=getWorkLoop();
+        auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
+            Args *a=static_cast<Args *>(a0);a->display->finishGpuSwap(a->status);return kIOReturnSuccess;
+        };
+        if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
+    }
     void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
-        transferred=false;validatedRequest=nullptr;
+        transferred=false;validatedRequest=nullptr;gpuRequest=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -133,6 +150,10 @@ public:
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+            // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
+            shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;return;
+        }
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
@@ -187,12 +208,24 @@ public:
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
     }
+    // The GPU client reported its copy (status 0) or lost it. Success retires the swap like a finished copy; anything else uses the CPU copy.
+    void finishGpuSwap(int status) {
+        const OriginalLegacySwapRequest *request=gpuRequest;
+        if(!request || request!=validatedRequest)return;
+        gpuRequest=nullptr;
+        if(status==0) {
+            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            finishTransfer(request,true);return;
+        }
+        native_legacy_gpu_fallback_observed(status);
+        transferred=false;gpuBypass=true;kickSwapQueue();gpuBypass=false;
+    }
     // Separately gated retirement after a real scanout store, shared by copied and blank frames.
-    void finishTransfer(const OriginalLegacySwapRequest *request) {
+    void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
         unsigned retire=0,cpuPresent=0;
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
-        if(retire==1 || cpuPresent==1) {
+        if(retire==1 || cpuPresent==1 || force) {
             // Only after the real copy and store barrier: select the actual
             // pending head and let the unchanged family release it and wake
             // waiters. This reports memory scanout completion, not a panel
@@ -321,3 +354,4 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
+extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
