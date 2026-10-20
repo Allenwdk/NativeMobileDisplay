@@ -34,6 +34,11 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
+// 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
+// either way (no compression is implemented), so the bytes are the same.
+static inline bool nativeBgra(uint32_t format,uint32_t planes) {
+    return (format==0x42475241 && !planes) || (format==0x26424741 && planes<=1);
+}
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -146,7 +151,7 @@ public:
         uint64_t allocation=native_legacy_surface_allocation(surface);
         if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
            native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
-           native_legacy_surface_format(surface)!=0x42475241 || native_legacy_surface_planes(surface) ||
+           !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
            PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
            video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
@@ -277,7 +282,7 @@ public:
                     // A surface larger than the display (rows or lines padded to the GPU's alignment) is accepted: only the visible rectangle,
                     // which the request's rectangles already name as the whole display, is copied.
                     if(native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height &&
-                       native_legacy_surface_format(surface)==0x42475241 && !native_legacy_surface_planes(surface) &&
+                       nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) &&
                        memory && memory->metaCast("IOMemoryDescriptor") &&
                        native_legacy_surface_bounds(width,height,native_legacy_surface_stride(surface),
                            native_legacy_surface_allocation(surface),memory->getLength())) {
