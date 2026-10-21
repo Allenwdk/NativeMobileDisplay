@@ -35,6 +35,11 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
+// Original slot242 and the surface -> Mach-port helper it uses, bound by the
+// builder. The helper is called only when the original entitlement gate says
+// kIOReturnNotPrivileged.
+extern "C" IOReturn uke_original_default_surface_port(void *,task_t,uint32_t *);
+extern "C" IOReturn uke_surface_copy_port_name(void *,task_t,void *,uint32_t *);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -377,6 +382,27 @@ public:
         native_legacy_client_enter(task,type);
         IOReturn status=IOMobileFramebufferLegacy::newUserClient(task,security,type,client);
         native_legacy_client_observed(status,status==kIOReturnSuccess && client?*client:nullptr);return status;
+    }
+    // s_default_fb_surface's port step. With PE_i_can_has_debugger()==0 the
+    // original slot242 only accepts a task with the explicit-graphics
+    // entitlement and otherwise returns kIOReturnNotPrivileged. Use the
+    // original surface->port helper directly as the bring-up fallback; it does
+    // the same send-right/copyPortNameForObjectInTask translation.
+    IOReturn copyDefaultSurfacePortName(task_t task,uint32_t *name) override {
+        IOReturn status=uke_original_default_surface_port(this,task,name);
+        if(status==kIOReturnNotPrivileged && task && name) {
+            void *root=nullptr,*surface=nullptr;
+            memcpy(&root,reinterpret_cast<unsigned char *>(this)+0x1600,sizeof(root));
+            memcpy(&surface,reinterpret_cast<unsigned char *>(this)+0x1618,sizeof(surface));
+            if(root && surface) {
+                IOReturn bypass=uke_surface_copy_port_name(root,task,surface,name);
+                IOLog("UKE: default surface port fallback root=%p surface=%p status=%08x\n",
+                    root,surface,(unsigned)bypass);
+                return bypass;
+            }
+        }
+        IOLog("UKE: default surface port status=%08x\n",(unsigned)status);
+        return status;
     }
     bool startHardware() override {
         unsigned enabled=0;
