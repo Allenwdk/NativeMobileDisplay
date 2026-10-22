@@ -121,11 +121,14 @@ public:
         return true;
     }
     IOReturn setPowerState(unsigned long ordinal,IOService *device) override {
-        if(!logicalPM)return IOMobileFramebufferLegacy::setPowerState(ordinal,device);
+        (void)device;
         if(ordinal>1 || !bootMapping){native_legacy_pm_observed(3,kIOReturnUnsupported,ordinal);return kIOReturnUnsupported;}
         native_legacy_pm_observed(3,kIOReturnSuccess,ordinal);
-        IOReturn status=IOMobileFramebufferLegacy::setPowerState(ordinal,device);
-        native_legacy_pm_observed(4,status,ordinal);return status;
+        // The panel is already powered by the firmware (GOP) and the original
+        // platform subclass/provider is absent.  Do not enter the original
+        // power transition: it requests the display rail and resets the tablet.
+        native_legacy_pm_observed(4,kIOReturnSuccess,ordinal);
+        return kIOReturnSuccess;
     }
     // The explicit offline system-client experiment publishes only the real
     // GOP mode. Unknown backend calls retain their stop-with-caller guards.
