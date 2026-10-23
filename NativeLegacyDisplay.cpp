@@ -153,10 +153,15 @@ public:
         kicking=false;
     }
     void kickOnce() {
+        native_legacy_swap_stage(3);
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
-        if(!request || !isValidated(request))return;
+        if(!request)return;
+        // The family may queue a swap and kick without running slot 296 first;
+        // validate the queued request here so the kick does not depend on the
+        // absent platform layer's queue thread.
+        if(!isValidated(request) && !validateSwap(request))return;
         // This bounded first-frame transfer preserves the original queue's
         // resource ownership. Separately gated retirement follows the copy;
         // neither path signals a hardware fence, announces a vblank or
