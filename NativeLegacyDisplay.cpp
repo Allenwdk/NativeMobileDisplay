@@ -152,11 +152,20 @@ public:
         } while(rekick && !transferred);
         kicking=false;
     }
+    // The original SwapEnd gate action walks the active list whose head is at
+    // +5496 (requests linked at +2960); +5480 is a different queue and stays
+    // empty on this userland. Prefer it, then fall back.
+    const OriginalLegacySwapRequest *queuedSwapRequest() const {
+        const OriginalLegacySwapRequest *request=nullptr;
+        memcpy(&request,reinterpret_cast<const unsigned char *>(this)+5496,sizeof(request));
+        if(!request)memcpy(&request,reinterpret_cast<const unsigned char *>(this)+5480,sizeof(request));
+        return request;
+    }
     void kickOnce() {
         native_legacy_swap_stage(3);
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
-        const OriginalLegacySwapRequest *request=pendingSwapRequest();
+        const OriginalLegacySwapRequest *request=queuedSwapRequest();
         if(!request)return;
         // The family may queue a swap and kick without running slot 296 first;
         // validate the queued request here so the kick does not depend on the
