@@ -40,6 +40,11 @@ extern "C" void native_legacy_gpu_fallback_observed(int status);
 // kIOReturnNotPrivileged.
 extern "C" IOReturn uke_original_default_surface_port(void *,task_t,uint32_t *);
 extern "C" IOReturn uke_surface_copy_port_name(void *,task_t,void *,uint32_t *);
+// The family's IOSurfaceRoot lookup pair (bound by the builder), exactly as swap_submit
+// calls them: lookup(root, surfaceId, task) resolves an overlay surface ID the original
+// 4-layer loop never reaches.
+extern "C" void *uke_surface_root_lookup(void *,uint32_t,void *);
+extern "C" void *uke_surface_lookup_task(void);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -71,6 +76,12 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
+    // Base-plane presentation (offline-legacy-base-present=1): the compositor renders the base
+    // into the default framebuffer surface (the one slot 242 hands the render server) and submits
+    // overlay-only transactions whose record layers carry no surfaces, so no swap surface ever
+    // validates; presentBase copies that default surface to the GOP instead.
+    unsigned baseCopies=0;
+    SInt32 baseBusy=0;
 public:
     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
     void gpuComplete(int status) {
@@ -80,6 +91,82 @@ public:
             Args *a=static_cast<Args *>(a0);a->display->finishGpuSwap(a->status);return kIOReturnSuccess;
         };
         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
+    }
+    // A transaction that updates only overlay layers carries no surface the family translates
+    // (its per-layer IDs are 0 and the real overlays sit beyond the original 4-layer loop), and
+    // the original SwapEnd has already retired the request when this runs; the pixels live in the
+    // overlay IOSurface the record names (frameSurfaceId, resolved through the family's own
+    // IOSurfaceRoot lookup, which only covers layers 0..3). A transaction with no overlay surface
+    // (the compositor's blank/idle updates) presents nothing and keeps the previous frame: the
+    // default framebuffer surface is pure black on this compositor and presenting it would blank
+    // the panel a few seconds after the first real frame.
+    // Called from the framebuffer user-client interpose after the original selector 5 completes,
+    // on the compositor's own thread, so the surface cannot be destroyed under the copy.
+    void presentBase(unsigned frameSurfaceId) {
+        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-base-present",&enabled,sizeof(enabled));
+        if(enabled!=1 || !bootMapping || !primary)return;
+        if(!frameSurfaceId)return;
+        if(!OSCompareAndSwap(0,1,&baseBusy))return;
+        do {
+            OSObject *object=nullptr;const char *kind="frame";
+            void *root=nullptr;memcpy(&root,reinterpret_cast<unsigned char *>(this)+0x1600,sizeof(root));
+            if(root) {
+                void *found=uke_surface_root_lookup(root,frameSurfaceId,uke_surface_lookup_task());
+                if(found && reinterpret_cast<OSObject *>(found)->metaCast("IOSurface")) {
+                    object=reinterpret_cast<OSObject *>(found);
+                } else if(baseCopies<2) {
+                    IOLog("UKE: frame surface id=%u lookup=%p root=%p\n",(unsigned)frameSurfaceId,found,root);
+                }
+            }
+            if(!object)break;
+            uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+            IOMemoryDescriptor *memory=(object && object->metaCast("IOSurface"))?native_legacy_surface_descriptor(object):nullptr;
+            uint64_t sourceStride=memory?native_legacy_surface_stride(object):0;
+            uint64_t allocation=memory?native_legacy_surface_allocation(object):0;
+            uint32_t format=object?native_legacy_surface_format(object):0,planes=object?native_legacy_surface_planes(object):0;
+            PE_Video video={};
+            bool presentable=memory && memory->metaCast("IOMemoryDescriptor") &&
+                native_legacy_surface_width(object)>=width && native_legacy_surface_height(object)>=height &&
+                native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) &&
+                (format==0x42475241 || (format==0x26424741 && planes<=1)) &&
+                !PE_current_console(&video) && video.v_baseAddr==bootMapping->getPhysicalAddress() &&
+                video.v_width==width && video.v_height==height && video.v_depth==32 && !video.v_rotate &&
+                native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength());
+            if(baseCopies<2)
+                IOLog("UKE: %s surface=%p %llux%llu stride=%llu alloc=%llu format=%08x planes=%u mem=%p bytes=%llu presentable=%d\n",
+                    kind,object,(unsigned long long)(object?native_legacy_surface_width(object):0),(unsigned long long)(object?native_legacy_surface_height(object):0),
+                    (unsigned long long)sourceStride,(unsigned long long)allocation,(unsigned)format,(unsigned)planes,memory,
+                    (unsigned long long)(memory?memory->getLength():0),(int)presentable);
+            if(!presentable)break;
+            IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+            if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
+                if(source)native_legacy_transfer_observed(kIOReturnNoMemory,nullptr,0);
+                OSSafeReleaseNULL(source);break;
+            }
+            uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+            bool copied=native_legacy_prepare_scanout() &&
+                native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                    bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                    source->getLength(),sourceStride,width,height);
+            if(!copied) {
+                native_legacy_transfer_observed(kIOReturnBadArgument,nullptr,0);
+                OSSafeReleaseNULL(source);break;
+            }
+            __asm__ volatile("dsb sy" ::: "memory");
+            {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,(uint64_t)width*height*4);}
+            ++baseCopies;
+            if(baseCopies<=2) {
+                uint64_t scan[5];
+                if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
+                    IOLog("UKE: %s copy %u nonblack=%llu bbox=(%llu,%llu)-(%llu,%llu)\n",kind,baseCopies,
+                        (unsigned long long)scan[0],(unsigned long long)scan[1],(unsigned long long)scan[2],
+                        (unsigned long long)scan[3],(unsigned long long)scan[4]);
+            }
+            native_legacy_frame_observed(0,0,0,0,0,0);
+            native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
+            OSSafeReleaseNULL(source);
+        } while(false);
+        baseBusy=0;
     }
     void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
@@ -458,3 +545,4 @@ public:
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
+extern "C" void native_legacy_present_base(void *display,unsigned frameSurfaceId) {if(display)static_cast<NativeLegacyDisplay *>(display)->presentBase(frameSurfaceId);}
