@@ -5,7 +5,10 @@
 #include "OriginalLegacyFramebufferABI.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOWorkLoop.h>
+#include <kern/task.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -35,6 +38,9 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
+// DPU direct scanout (uke-dpu-scanout=3): the display bank stage-1 window from NativeUfs.
+extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
+extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 // Original slot242 and the surface -> Mach-port helper it uses, bound by the
 // builder. The helper is called only when the original entitlement gate says
 // kIOReturnNotPrivileged.
@@ -82,6 +88,83 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // validates; presentBase copies that default surface to the GOP instead.
     unsigned baseCopies=0;
     SInt32 baseBusy=0;
+    // D1 direct scanout for plain BGRA surfaces (uke-dpu-scanout=3): map the compositor's
+    // IOSurface pages into a slot of the display bank's stage-1 window (native_ufs_dpu_map)
+    // and make the live VIG0/VIG1 pipes fetch them. No CPU copy. Four slots cover the frame
+    // being flipped and the ones still on screen; any failure returns to the CPU copy.
+    IOMemoryMap *mdpMap=nullptr;volatile uint32_t *mdp=nullptr;
+    struct DpuSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;};
+    DpuSlot dpuSlots[4]={};unsigned dpuNext=0;bool dpuOn=false;
+    uint32_t dpuSavedSrc[2]={},dpuSavedStride[2]={};
+    bool dpuStart() {
+        if(mdp)return true;
+        unsigned mode=0;PE_parse_boot_argn("uke-dpu-scanout",&mode,sizeof(mode));
+        if(mode<3)return false;
+        IODeviceMemory *memory=IODeviceMemory::withRange(0xae01000,0x8f000);
+        mdpMap=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(memory)memory->release();
+        if(!mdpMap || !mdpMap->getVirtualAddress())return false;
+        mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
+        dpuSavedSrc[0]=mdp[(0x4000+0x14)/4];dpuSavedStride[0]=mdp[(0x4000+0x24)/4];
+        dpuSavedSrc[1]=mdp[(0x6000+0x14)/4];dpuSavedStride[1]=mdp[(0x6000+0x24)/4];
+        dpuOn=true;
+        IOLog("UKE DPU: direct ready\n");
+        return true;
+    }
+    void dpuReleaseSlot(unsigned k) {
+        DpuSlot &slot=dpuSlots[k];
+        if(slot.memory)slot.memory->complete();
+        OSSafeReleaseNULL(slot.memory);OSSafeReleaseNULL(slot.surface);
+        slot.iova=0;
+    }
+    void dpuStop() {
+        if(!dpuOn)return;
+        mdp[(0x4000+0x14)/4]=dpuSavedSrc[0];mdp[(0x6000+0x14)/4]=dpuSavedSrc[1];
+        mdp[(0x4000+0x24)/4]=dpuSavedStride[0];mdp[(0x6000+0x24)/4]=dpuSavedStride[1];
+        __asm__ volatile("dsb sy":::"memory");mdp[0x15018/4]=0x3;__asm__ volatile("dsb sy":::"memory");
+        for(unsigned k=0;k<4;++k)dpuReleaseSlot(k);
+        dpuOn=false;
+    }
+    int dpuSlot(OSObject *surface,IOMemoryDescriptor *memory) {
+        for(unsigned k=0;k<4;++k)if(dpuSlots[k].surface==surface && dpuSlots[k].memory==memory)return int(k);
+        const unsigned k=dpuNext;dpuNext=(dpuNext+1)&3;
+        dpuReleaseSlot(k);
+        if(memory->getLength()>32ull<<20 || memory->prepare()!=kIOReturnSuccess)return -1;
+        const unsigned maxPages=static_cast<unsigned>(memory->getLength()/4096+1);
+        uint64_t *pages=static_cast<uint64_t *>(IOMallocData(maxPages*sizeof(uint64_t)));
+        if(!pages){memory->complete();return -1;}
+        unsigned count=0;bool ok=true;
+        for(IOByteCount offset=0;ok && offset<memory->getLength();) {
+            IOByteCount length=0;
+            const addr64_t pa=memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+            if(!pa || (pa&0xfff) || !length) {ok=false;break;}
+            for(IOByteCount at=0;at<length && offset+at<memory->getLength();at+=4096)pages[count++]=pa+at;
+            offset+=length;
+        }
+        const uint32_t iova=ok?native_ufs_dpu_map(k,pages,count):0;
+        IOFreeData(pages,maxPages*sizeof(uint64_t));
+        if(!iova){memory->complete();return -1;}
+        surface->retain();memory->retain();
+        dpuSlots[k]={surface,memory,iova};
+        IOLog("UKE DPU: direct slot%u iova=%08x pages=%u bytes=%llu\n",k,iova,count,(unsigned long long)memory->getLength());
+        return int(k);
+    }
+    bool dpuPresentBgra(OSObject *surface,IOMemoryDescriptor *memory,uint64_t sourceStride,
+                        uint32_t width,uint32_t height,uint64_t allocation) {
+        if(!dpuOn && !dpuStart())return false;
+        if(!&native_ufs_dpu_state || !(native_ufs_dpu_state>>31))return false;
+        if(!memory || sourceStride<width*4 || allocation<sourceStride*height)return false;
+        const int k=dpuSlot(surface,memory);
+        if(k<0)return false;
+        if(!native_legacy_prepare_scanout())return false;
+        mdp[(0x4000+0x14)/4]=dpuSlots[k].iova;mdp[(0x6000+0x14)/4]=dpuSlots[k].iova;
+        mdp[(0x4000+0x24)/4]=uint32_t(sourceStride)&0xffff;mdp[(0x6000+0x24)/4]=uint32_t(sourceStride)&0xffff;
+        __asm__ volatile("dsb sy":::"memory");
+        mdp[0x15018/4]=0x3;
+        __asm__ volatile("dsb sy":::"memory");
+        for(unsigned spin=0;spin<2000;++spin){if(!(mdp[0x15018/4]&0x3))break;IODelay(50);}
+        return true;
+    }
 public:
     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
     void gpuComplete(int status) {
@@ -118,6 +201,17 @@ public:
                     IOLog("UKE: frame surface id=%u lookup=%p root=%p\n",(unsigned)frameSurfaceId,found,root);
                 }
             }
+            // swap_submit's own second rule: a record ID equal to the default
+            // surface's ID names fb+0x1618 directly. The adopted surface is not
+            // necessarily in the root registry the lookup walks, so keep that
+            // rule here too (only for an ID the record named, never a fallback).
+            if(!object) {
+                OSObject *named=nullptr;memcpy(&named,reinterpret_cast<unsigned char *>(this)+0x1618,sizeof(named));
+                uint32_t sid=0;
+                if(named)memcpy(&sid,reinterpret_cast<unsigned char *>(named)+0x10,sizeof(sid));
+                if(named && sid==frameSurfaceId) {object=named;kind="default";}
+                if(baseCopies<2)IOLog("UKE: frame surface id=%u default sid=%u named=%p\n",(unsigned)frameSurfaceId,(unsigned)sid,named);
+            }
             if(!object)break;
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
             IOMemoryDescriptor *memory=(object && object->metaCast("IOSurface"))?native_legacy_surface_descriptor(object):nullptr;
@@ -128,7 +222,8 @@ public:
             bool presentable=memory && memory->metaCast("IOMemoryDescriptor") &&
                 native_legacy_surface_width(object)>=width && native_legacy_surface_height(object)>=height &&
                 native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) &&
-                (format==0x42475241 || (format==0x26424741 && planes<=1)) &&
+                (format==0x42475241 || (format==0x26424741 && planes<=1) ||
+                 (format==0x62336138 && planes>=2)) &&
                 !PE_current_console(&video) && video.v_baseAddr==bootMapping->getPhysicalAddress() &&
                 video.v_width==width && video.v_height==height && video.v_depth==32 && !video.v_rotate &&
                 native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength());
@@ -138,6 +233,68 @@ public:
                     (unsigned long long)sourceStride,(unsigned long long)allocation,(unsigned)format,(unsigned)planes,memory,
                     (unsigned long long)(memory?memory->getLength():0),(int)presentable);
             if(!presentable)break;
+            // Plain BGRA rows can be scanned in place: map the IOSurface pages into the display
+            // bank's stage-1 window and flip the live pipes to that IOVA (no CPU copy).
+            if((format==0x42475241 || (format==0x26424741 && planes<=1)) &&
+               dpuPresentBgra(object,memory,sourceStride,width,height,allocation)) {
+                ++baseCopies;
+                native_legacy_frame_observed(0,0,0,0,0,0);
+                native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
+                break;
+            }
+            // The render server's own two-plane surface ('b3a8', RGB10A8_2P_XR10:
+            // one color word per texel in plane 0 and its alpha byte in plane 1,
+            // the layout metal2vulkan's surface_two_planes tests measured). The
+            // GPU hand-off and the copy helpers move plain rows, so this spelling
+            // decodes into the scanout here; the raw pages would be gibberish.
+            if(format==0x62336138 && planes>=2) {
+                uint64_t row0=(uint64_t)width*4,row1=width;
+                uint64_t base1=(uint64_t)width*height*4;
+                if(allocation>=base1+row1*height && sourceStride>=row0) {
+                    IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+                    uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+                    bool ok=source && source->getVirtualAddress() && source->getLength()>=allocation &&
+                        native_legacy_prepare_scanout();
+                    if(ok) {
+                        volatile uint32_t *scan=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
+                        const unsigned char *plane0=reinterpret_cast<const unsigned char *>(source->getVirtualAddress());
+                        const unsigned char *plane1=plane0+base1;
+                        for(uint32_t y=0;ok && y<height;++y) {
+                            const unsigned char *row=plane0+y*row0,*alpha=plane1+y*row1;
+                            volatile uint32_t *out=scan+(uint64_t)y*(video.v_rowBytes/4);
+                            for(uint32_t x=0;x<width;++x) {
+                                uint32_t word;memcpy(&word,row+4*x,4);
+                                uint32_t b=(word&0x3ff)>>2,g=((word>>10)&0x3ff)>>2,r=((word>>20)&0x3ff)>>2;
+                                out[x]=(uint32_t)alpha[x]<<24|r<<16|g<<8|b;
+                            }
+                        }
+                        __asm__ volatile("dsb sy" ::: "memory");
+                    }
+                    if(ok) {
+                        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,(uint64_t)width*height*4);}
+                        ++baseCopies;
+                        native_legacy_frame_observed(0,0,0,0,0,0);
+                        native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
+                    } else {
+                        native_legacy_transfer_observed(kIOReturnBadArgument,nullptr,0);
+                    }
+                    OSSafeReleaseNULL(source);
+                    break;
+                }
+            }
+            // Upstream's presentation path (sheng-fb-gpu=1): offer the frame to
+            // the privileged GPU scanout client, whose GpuScanoutClient blits
+            // the surface pages into the scanout on the GPU — no CPU pixel
+            // copy. A refused offer (no client, or a frame still in flight)
+            // falls back to the CPU copy below, exactly like kickOnce's
+            // hand-off; the plugin's completion needs no request to retire.
+            if(native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+                native_legacy_swap_stage(1);
+                ++baseCopies;
+                native_legacy_frame_observed(0,0,0,0,0,0);
+                native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
+                break;
+            }
             IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
             if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
                 if(source)native_legacy_transfer_observed(kIOReturnNoMemory,nullptr,0);
@@ -170,6 +327,7 @@ public:
     }
     void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
+        dpuStop();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
@@ -187,6 +345,7 @@ public:
     bool start(IOService *provider) override {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
         if(primary && bootMapping)announcePoweredByFirmware();
+        if(primary && bootMapping)dpuStart();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
         unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
