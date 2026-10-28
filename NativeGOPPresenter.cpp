@@ -39,6 +39,14 @@ class NativeGOPPresenter : public IOService {
     struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
             uint64_t stride;uint32_t width,height;} swap={};
     uint64_t swapSequence=0;
+    // The compositor swaps the same few surfaces. Each one's mapping into the client stays here under an id (NGPSwap reserved), so the client
+    // keeps its GPU import of those pages and neither side maps 12000 scattered pages again per frame (untagged-203fd45bf: a half-float
+    // frame's import and mapping took most of its 22 ms commit-to-complete). The client keeps fewer imports (4) than these mappings.
+    struct Kept {IOMemoryDescriptor *memory;IOMemoryMap *map;task_t task;uint32_t id;uint64_t used;};
+    static constexpr unsigned kKept=6;
+    Kept kept[kKept]={};
+    uint32_t keptId=0;uint64_t keptUse=0;
+    void dropKept();
     IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
     IOReturn completeSwap(uint64_t sequence,int status);
     void abandonSwap();
@@ -177,9 +185,29 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
         out->width=width;out->height=height;out->format=NGP_DIRECT;out->reserved=0;
         IOLockUnlock(gate);memory->release();return kIOReturnSuccess;
     }
+    // Copy mode: each swapped surface's mapping stays here under an id (NGPSwap reserved) so the client's import cache hits across
+    // frames instead of importing the surface's thousands of scattered pages again (upstream 90b64ef: that import and mapping took
+    // most of a 22 ms commit with the GPU mostly idle).
+    IOMemoryMap *map=nullptr;uint32_t id=0;
+    for(Kept &k:kept)if(k.map && k.memory==memory && k.task==task && k.map->getLength()==memory->getLength()) {
+        map=k.map;map->retain();id=k.id;k.used=++keptUse;break;
+    }
     IOLockUnlock(gate);
     // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
-    IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
+    if(!map) {
+        map=memory->createMappingInTask(task,0,kIOMapAnywhere);
+        if(map && map->getVirtualAddress()) {
+            IOLockLock(gate);
+            Kept *victim=&kept[0];
+            for(Kept &k:kept) {if(!k.map) {victim=&k;break;} if(k.used<victim->used)victim=&k;}
+            Kept old=*victim;
+            memory->retain();map->retain();task_reference(task);
+            id=++keptId;if(!id)id=++keptId;
+            *victim={memory,map,task,id,++keptUse};
+            IOLockUnlock(gate);
+            OSSafeReleaseNULL(old.map);OSSafeReleaseNULL(old.memory);if(old.task)task_deallocate(old.task);
+        }
+    }
     memory->release();
     IOLockLock(gate);
     if(!map || !map->getVirtualAddress() || !swap.offered || swap.sequence!=sequence) {
@@ -187,7 +215,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     }
     swap.map=map;
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
-    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=0;
+    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=id;
     IOLockUnlock(gate);return kIOReturnSuccess;
 }
 IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
@@ -201,8 +229,18 @@ IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
     native_legacy_gpu_complete(done.display,status);return kIOReturnSuccess;
 }
 // The client went away with a frame outstanding: the display driver is told it failed, so it can use its own path instead of waiting forever.
+// The kept mappings go with the client (its task's mappings, the surfaces they hold).
+void NativeGOPPresenter::dropKept() {
+    if(!gate)return;
+    Kept all[kKept];
+    IOLockLock(gate);
+    for(unsigned i=0;i<kKept;++i){all[i]=kept[i];kept[i]={};}
+    IOLockUnlock(gate);
+    for(Kept &k:all){OSSafeReleaseNULL(k.map);OSSafeReleaseNULL(k.memory);if(k.task)task_deallocate(k.task);}
+}
 void NativeGOPPresenter::abandonSwap() {
     if(!gate)return;
+    dropKept();
     IOLockLock(gate);
     gpuClient=false;
     auto done=swap;swap={};
