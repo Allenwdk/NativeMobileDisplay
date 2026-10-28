@@ -92,7 +92,12 @@ bool NativeGOPPresenter::start(IOService *provider) {
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
     {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
-    mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
+    // With the DPU direct path on, the display scans the offered surface itself and needs only the frame's GPU completion as its
+    // fence: the mode word says so, and a client that does not know NGP_DIRECT refuses the mode, which leaves the display its own
+    // timing. Otherwise the client copies the frame into this scanout as before.
+    unsigned dpu=0;PE_parse_boot_argn("uke-dpu-scanout",&dpu,sizeof dpu);
+    const uint32_t scanoutMode=(gpuMode && dpu>=3)?NGP_DIRECT:NGP_BGRX8888;
+    mode={NGP_VERSION,scanoutMode,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
 }
@@ -163,6 +168,15 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     swap.delivered=true;
     IOMemoryDescriptor *memory=swap.memory;memory->retain();
     const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
+    // The display scans the frame itself in the direct mode, so the client needs neither the pages nor a mapping of them. Mapping a
+    // 3200x2136 surface into the client's task is thousands of page-table entries taken on the compositor's own thread (upstream's
+    // keep-each-surface-mapping fix, NativeMobileDisplay 90b64ef, measured it as most of a 22 ms commit), so it is not done here.
+    if(mode.format==NGP_DIRECT) {
+        swap.map=nullptr;
+        out->sequence=sequence;out->address=0;out->bytes=0;out->stride=stride;
+        out->width=width;out->height=height;out->format=NGP_DIRECT;out->reserved=0;
+        IOLockUnlock(gate);memory->release();return kIOReturnSuccess;
+    }
     IOLockUnlock(gate);
     // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
     IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);

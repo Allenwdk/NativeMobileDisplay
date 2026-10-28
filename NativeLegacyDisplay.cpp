@@ -8,7 +8,9 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <kern/task.h>
+#include <kern/clock.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -38,6 +40,18 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
+// Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off), the port of the upstream display's tick: the original family
+// sends the compositor's vsync message (type 5) through native_legacy_vsync_notify, the unchanged original sender, but only a platform
+// subclass calls it from the panel's vblank and that subclass is not part of this port. The GOP scanout has no vblank interrupt, so a
+// work-loop timer stands in for it while at least one client has vsync notifications enabled. native_legacy_set_refresh_properties is
+// the original setDisplayRefreshProperties: it publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
+extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);
+extern "C" bool native_legacy_set_refresh_properties(void *display);
+// Events: 0 armed, 1 sent, 2 idle (no client), 3 late (deadline passed, cadence restarted), 4 started, 5 refresh properties reported.
+extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
+// The GPU probe's answer to "has everything submitted so far retired" (the CP ring drained). Weak: a configuration
+// without the probe counts nothing.
+extern "C" bool native_gpu_idle(void) __attribute__((weak_import));
 // DPU direct scanout (uke-dpu-scanout=3): the display bank stage-1 window from NativeUfs.
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
@@ -88,14 +102,62 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // validates; presentBase copies that default surface to the GOP instead.
     unsigned baseCopies=0;
     SInt32 baseBusy=0;
-    // D1 direct scanout for plain BGRA surfaces (uke-dpu-scanout=3): map the compositor's
-    // IOSurface pages into a slot of the display bank's stage-1 window (native_ufs_dpu_map)
-    // and make the live VIG0/VIG1 pipes fetch them. No CPU copy. Four slots cover the frame
-    // being flipped and the ones still on screen; any failure returns to the CPU copy.
+    // D1 direct scanout for the compositor's surfaces (uke-dpu-scanout=3): map the IOSurface pages
+    // into a slot of the display bank's stage-1 window (native_ufs_dpu_map) and make the live
+    // VIG0/VIG1 pipes fetch them. No CPU copy and no GPU copy. Four slots cover the frame being
+    // flipped and the ones still on screen; any failure returns to the CPU copy.
+    // Two source spellings are scanned here, told apart by the SSPP source format:
+    //  - plain 32-bit BGRA, the firmware's own word order (the value read back at start);
+    //  - the render server's two-plane 'b3a8' (RGB10A8_2P_XR10) frame, whose colour words are
+    //    plane 0 and whose alpha byte plane 1. Plane 0 is exactly a 10-10-10-2 word, which the
+    //    VIG pipe unpacks natively as XRGB2101010 (dpu_formats.c: same unpack pattern as ARGB8888,
+    //    alpha off and the DX bit on - the SSPP writes bit 14 for DPU_FORMAT_IS_DX and bit 8 only
+    //    with alpha_enable). The pipe scans plane 0 alone; the frame's alpha plane is separate and
+    //    a composed display frame is opaque.
     IOMemoryMap *mdpMap=nullptr;volatile uint32_t *mdp=nullptr;
-    struct DpuSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;};
-    DpuSlot dpuSlots[4]={};unsigned dpuNext=0;bool dpuOn=false;
-    uint32_t dpuSavedSrc[2]={},dpuSavedStride[2]={};
+    struct DpuSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t bytes,used;};
+    DpuSlot dpuSlots[4]={};uint64_t dpuSlotClock=0;int dpuShownSlot=-1;bool dpuOn=false;
+    /* The fence on the direct path. The compositor submits a swap before its GPU work has retired (gpucomp28 flipped the
+     * named frame straight away and the panel flickered on every change; gpucomp29 held each frame one swap longer and
+     * gpucomp27's counter showed the GPU ring still busy in 98% of flips, so "one frame older" was not one frame
+     * complete). A frame is therefore prepared at swap time (slot mapped, format resolved - both may sleep) and flipped
+     * from a work-loop timer only once the GPU has retired everything submitted by then (native_gpu_idle, the CP ring
+     * drained), so the pipes never scan a surface the GPU is still drawing. A newer frame replaces a frame still waiting;
+     * the timer flips anyway after the deadline below, counted, so a ring that never drains cannot freeze the panel. */
+    struct DpuFrame {int slot;uint64_t stride;bool tenBit;bool valid;};
+    DpuFrame dpuFrame={};
+    int dpuPendingSlot=-1;
+    IOTimerEventSource *dpuFenceTimer=nullptr;
+    IOLock *dpuLock=nullptr;
+    uint64_t dpuFenceBegan=0;
+    bool dpuGpuPending=false;   // the prepared frame was offered to the scanout client, which reports its GPU work done
+    static constexpr uint64_t kDpuFenceDeadlineUs=30000;
+    // The scanout client's answer may take longer than a frame when the GPU is loaded (blur passes); waiting is smoother than
+    // dropping the frame, which shows up as a skipped image in the middle of an animation.
+    static constexpr uint64_t kDpuOfferDeadlineUs=500000;
+    uint64_t dpuOfferBegan=0,dpuWaitTotalUs=0,dpuWaitMaxUs=0;
+    uint32_t dpuSavedSrc[2]={},dpuSavedStride[2]={},dpuSavedFormat[2]={},dpuSavedUnpack[2]={};
+    unsigned tenBitSamples=0;bool tenBitWarned=false;
+    // The refresh tick (boot-arg sheng-vsync=<Hz>), the upstream display's tick: a work-loop timer, armed while a client has vsync
+    // notifications registered, that sends the family's own vsync message (type 5) through native_legacy_vsync_notify. The timer runs
+    // on the family's work loop, the loop of the command gate that registers and removes the clients, so the queue at +5592 never
+    // changes while the sender walks it.
+    IOTimerEventSource *vsyncTimer=nullptr;
+    uint64_t vsyncInterval=0,vsyncNext=0;
+    unsigned vsyncHz=0;
+    bool vsyncArmed=false;
+    // The direct path's counters (P0 measurement): frames flipped by spelling, skips that kept the previous frame on screen, flips that
+    // fell back to the CPU decode, and the flush wait's worst and total time.
+    uint64_t dpuFlips=0,dpuTenBitFlips=0,dpuSkips=0,dpuFallbacks=0,dpuLatchMaxUs=0,dpuLatchTotalUs=0;
+    uint64_t dpuIdleFlips=0,dpuBusyFlips=0;
+    uint32_t skipLogged=0;
+    // The SSPP source-format word as stock dpu_hw_sspp_setup_format builds it (dpu_formats.c's
+    // XRGB2101010: the same unpack pattern as the firmware's ARGB8888, the alpha bit 8 off and
+    // the DX bit 14 - the 10-bit unpacker - on).
+    uint32_t dpuTenBitFormat(unsigned pipe) const {return (dpuSavedFormat[pipe]&~0x100u)|0x4000u;}
+    // XRGB2101010's word order is the firmware pipe's own (B in the low 8 bits, then G, R, A:
+    // dpu_formats.c's elements {C1_B_Cb, C0_G_Y, C2_R_Cr, C3_ALPHA} pack to 0x03020001).
+    bool dpuTenBitWordOrder() const {return dpuSavedUnpack[0]==0x03020001u && dpuSavedUnpack[1]==0x03020001u;}
     bool dpuStart() {
         if(mdp)return true;
         unsigned mode=0;PE_parse_boot_argn("uke-dpu-scanout",&mode,sizeof(mode));
@@ -107,8 +169,15 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
         dpuSavedSrc[0]=mdp[(0x4000+0x14)/4];dpuSavedStride[0]=mdp[(0x4000+0x24)/4];
         dpuSavedSrc[1]=mdp[(0x6000+0x14)/4];dpuSavedStride[1]=mdp[(0x6000+0x24)/4];
+        dpuSavedFormat[0]=mdp[(0x4000+0x30)/4];dpuSavedUnpack[0]=mdp[(0x4000+0x34)/4];
+        dpuSavedFormat[1]=mdp[(0x6000+0x30)/4];dpuSavedUnpack[1]=mdp[(0x6000+0x34)/4];
+        dpuLock=IOLockAlloc();
+        IOWorkLoop *loop=getWorkLoop();
+        dpuFenceTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::dpuFenceFired):nullptr;
+        if(dpuFenceTimer && loop->addEventSource(dpuFenceTimer)!=kIOReturnSuccess) {dpuFenceTimer->release();dpuFenceTimer=nullptr;}
         dpuOn=true;
-        IOLog("UKE DPU: direct ready\n");
+        IOLog("UKE DPU: direct ready fmt=%08x/%08x unpack=%08x tenbit=%08x fence=%s\n",
+            dpuSavedFormat[0],dpuSavedFormat[1],dpuSavedUnpack[0],dpuTenBitFormat(0),dpuFenceTimer?"timer":"none");
         return true;
     }
     void dpuReleaseSlot(unsigned k) {
@@ -119,51 +188,146 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     }
     void dpuStop() {
         if(!dpuOn)return;
+        if(dpuFenceTimer) {dpuFenceTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(dpuFenceTimer);OSSafeReleaseNULL(dpuFenceTimer);}
+        dpuFrame.valid=false;dpuPendingSlot=-1;
+        if(dpuLock){IOLockFree(dpuLock);dpuLock=nullptr;}
         mdp[(0x4000+0x14)/4]=dpuSavedSrc[0];mdp[(0x6000+0x14)/4]=dpuSavedSrc[1];
         mdp[(0x4000+0x24)/4]=dpuSavedStride[0];mdp[(0x6000+0x24)/4]=dpuSavedStride[1];
+        mdp[(0x4000+0x30)/4]=dpuSavedFormat[0];mdp[(0x6000+0x30)/4]=dpuSavedFormat[1];
+        mdp[(0x4000+0x34)/4]=dpuSavedUnpack[0];mdp[(0x6000+0x34)/4]=dpuSavedUnpack[1];
         __asm__ volatile("dsb sy":::"memory");mdp[0x15018/4]=0x3;__asm__ volatile("dsb sy":::"memory");
         for(unsigned k=0;k<4;++k)dpuReleaseSlot(k);
+        dpuShownSlot=-1;
         dpuOn=false;
     }
-    int dpuSlot(OSObject *surface,IOMemoryDescriptor *memory) {
-        for(unsigned k=0;k<4;++k)if(dpuSlots[k].surface==surface && dpuSlots[k].memory==memory)return int(k);
-        const unsigned k=dpuNext;dpuNext=(dpuNext+1)&3;
+    // Maps the pages the pipes fetch, a prefix of the surface for the two-plane spelling (plane 0
+    // alone: 27,340,800 bytes of a 32,601,344-byte frame, so the whole descriptor would not fit a
+    // 32 MiB slot). Retained while the slot holds the frame.
+    int dpuSlot(OSObject *surface,IOMemoryDescriptor *memory,uint64_t needed) {
+        ++dpuSlotClock;
+        for(unsigned k=0;k<4;++k)
+            if(dpuSlots[k].surface==surface && dpuSlots[k].memory==memory && dpuSlots[k].bytes>=needed) {dpuSlots[k].used=dpuSlotClock;return int(k);}
+        // Never the slot the pipes are scanning (upstream's directSlot rule): remapping a slot's pages while the pipe
+        // fetches from its IOVA makes the panel show a mixture of the old and the new frame for one latch, which is
+        // what a burst of new surfaces (an app transition, a blur effect) looked like. The oldest other slot goes.
+        int pick=-1;
+        for(unsigned k=0;k<4;++k) {
+            if(int(k)==dpuShownSlot || int(k)==dpuPendingSlot)continue;
+            if(pick<0 || !dpuSlots[k].surface || (dpuSlots[pick].surface && dpuSlots[k].used<dpuSlots[pick].used))pick=int(k);
+        }
+        if(pick<0)return -1;
+        const unsigned k=unsigned(pick);
         dpuReleaseSlot(k);
-        if(memory->getLength()>32ull<<20 || memory->prepare()!=kIOReturnSuccess)return -1;
-        const unsigned maxPages=static_cast<unsigned>(memory->getLength()/4096+1);
+        if(needed>32ull<<20 || memory->getLength()<needed || memory->prepare()!=kIOReturnSuccess)return -1;
+        const unsigned maxPages=static_cast<unsigned>((needed+4095)/4096);
         uint64_t *pages=static_cast<uint64_t *>(IOMallocData(maxPages*sizeof(uint64_t)));
         if(!pages){memory->complete();return -1;}
         unsigned count=0;bool ok=true;
-        for(IOByteCount offset=0;ok && offset<memory->getLength();) {
+        for(IOByteCount offset=0;ok && offset<needed;) {
             IOByteCount length=0;
             const addr64_t pa=memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
             if(!pa || (pa&0xfff) || !length) {ok=false;break;}
-            for(IOByteCount at=0;at<length && offset+at<memory->getLength();at+=4096)pages[count++]=pa+at;
+            for(IOByteCount at=0;at<length && offset+at<needed;at+=4096)pages[count++]=pa+at;
             offset+=length;
         }
-        const uint32_t iova=ok?native_ufs_dpu_map(k,pages,count):0;
+        const uint32_t iova=(ok && count)?native_ufs_dpu_map(k,pages,count):0;
         IOFreeData(pages,maxPages*sizeof(uint64_t));
         if(!iova){memory->complete();return -1;}
         surface->retain();memory->retain();
-        dpuSlots[k]={surface,memory,iova};
-        IOLog("UKE DPU: direct slot%u iova=%08x pages=%u bytes=%llu\n",k,iova,count,(unsigned long long)memory->getLength());
+        dpuSlots[k]={surface,memory,iova,needed,dpuSlotClock};
+        IOLog("UKE DPU: direct slot%u iova=%08x pages=%u bytes=%llu\n",k,iova,count,(unsigned long long)needed);
         return int(k);
     }
-    bool dpuPresentBgra(OSObject *surface,IOMemoryDescriptor *memory,uint64_t sourceStride,
-                        uint32_t width,uint32_t height,uint64_t allocation) {
+    // Evidence only (nothing is written): the first two two-plane frames' first colour word, one
+    // at the centre, and the alpha plane's byte at the same places, so the layout the pipes fetch
+    // is on record.
+    void dpuTenBitSample(IOMemoryDescriptor *memory,uint32_t width,uint32_t height) {
+        if(tenBitSamples>=2)return;
+        const uint64_t row0=(uint64_t)width*4,base1=(uint64_t)width*height*4,center=(height/2ull)*row0+(width/2ull)*4;
+        const uint64_t length=memory->getLength();
+        if(!width || !height || length<base1+(uint64_t)width*height || length<center+4)return;
+        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+        if(!source || !source->getVirtualAddress()) {OSSafeReleaseNULL(source);return;}
+        const unsigned char *p=reinterpret_cast<const unsigned char *>(source->getVirtualAddress());
+        uint32_t first=0,middle=0;unsigned char alpha0=0,alphaMid=0;
+        memcpy(&first,p,4);memcpy(&middle,p+center,4);
+        alpha0=p[base1];alphaMid=p[base1+(height/2ull)*width+(width/2ull)];
+        IOLog("UKE DPU: tenbit sample p0=%08x p0c=%08x alpha=%02x/%02x\n",first,middle,alpha0,alphaMid);
+        ++tenBitSamples;
+        OSSafeReleaseNULL(source);
+    }
+    // Prepares a frame for the direct path: maps its slot and resolves the source format (the firmware's own 32-bit
+    // word for BGRA, the DX/10-bit unpack of the same word order for the two-plane spelling's colour plane). The flip
+    // itself waits for the fence (dpuFenceTick).
+    bool dpuPrepareFrame(OSObject *surface,IOMemoryDescriptor *memory,uint64_t sourceStride,
+                        uint32_t width,uint32_t height,uint64_t allocation,bool tenBit) {
         if(!dpuOn && !dpuStart())return false;
         if(!&native_ufs_dpu_state || !(native_ufs_dpu_state>>31))return false;
         if(!memory || sourceStride<width*4 || allocation<sourceStride*height)return false;
-        const int k=dpuSlot(surface,memory);
+        if(tenBit && !dpuTenBitWordOrder()) {
+            if(!tenBitWarned) {tenBitWarned=true;IOLog("UKE DPU: tenbit refused unpack=%08x/%08x\n",dpuSavedUnpack[0],dpuSavedUnpack[1]);}
+            return false;
+        }
+        const uint64_t needed=sourceStride*height;
+        const int k=dpuSlot(surface,memory,needed);
         if(k<0)return false;
         if(!native_legacy_prepare_scanout())return false;
-        mdp[(0x4000+0x14)/4]=dpuSlots[k].iova;mdp[(0x6000+0x14)/4]=dpuSlots[k].iova;
-        mdp[(0x4000+0x24)/4]=uint32_t(sourceStride)&0xffff;mdp[(0x6000+0x24)/4]=uint32_t(sourceStride)&0xffff;
+        if(tenBit)dpuTenBitSample(memory,width,height);
+        if(dpuLock)IOLockLock(dpuLock);
+        dpuFrame={k,sourceStride,tenBit,true};dpuPendingSlot=k;dpuFenceBegan=mach_absolute_time();
+        if(dpuLock)IOLockUnlock(dpuLock);
+        return true;
+    }
+    // Flips the prepared frame. Register writes only, so it can run from the work-loop timer.
+    void dpuFlipPrepared(int slot,uint64_t stride,bool tenBit) {
+        const uint32_t iova=dpuSlots[slot].iova;
+        mdp[(0x4000+0x14)/4]=iova;mdp[(0x6000+0x14)/4]=iova;
+        mdp[(0x4000+0x24)/4]=uint32_t(stride)&0xffff;mdp[(0x6000+0x24)/4]=uint32_t(stride)&0xffff;
+        mdp[(0x4000+0x30)/4]=tenBit?dpuTenBitFormat(0):dpuSavedFormat[0];
+        mdp[(0x6000+0x30)/4]=tenBit?dpuTenBitFormat(1):dpuSavedFormat[1];
+        mdp[(0x4000+0x34)/4]=dpuSavedUnpack[0];mdp[(0x6000+0x34)/4]=dpuSavedUnpack[1];
         __asm__ volatile("dsb sy":::"memory");
+        const uint64_t latchBegan=mach_absolute_time();
         mdp[0x15018/4]=0x3;
         __asm__ volatile("dsb sy":::"memory");
-        for(unsigned spin=0;spin<2000;++spin){if(!(mdp[0x15018/4]&0x3))break;IODelay(50);}
-        return true;
+        for(unsigned spin=0;spin<20;++spin){if(!(mdp[0x15018/4]&0x3))break;IODelay(50);}
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchBegan,&ns);
+        const uint64_t us=ns/1000;
+        dpuLatchTotalUs=dpuLatchTotalUs+us;
+        if(us>dpuLatchMaxUs)dpuLatchMaxUs=us;
+        dpuShownSlot=slot;
+        ++dpuFlips;if(tenBit)++dpuTenBitFlips;
+        if((dpuFlips%120)==0)
+            IOLog("UKE DPU: flip n=%llu tb=%llu skip=%llu fb=%llu latch=%lluus max=%lluus vsync=%u fence=%llu/%llu gpu=%lluus max=%lluus\n",
+                (unsigned long long)dpuFlips,(unsigned long long)dpuTenBitFlips,(unsigned long long)dpuSkips,
+                (unsigned long long)dpuFallbacks,(unsigned long long)(dpuFlips?dpuLatchTotalUs/dpuFlips:0),
+                (unsigned long long)dpuLatchMaxUs,vsyncHz,(unsigned long long)dpuIdleFlips,(unsigned long long)dpuBusyFlips,
+                (unsigned long long)(dpuFlips?dpuWaitTotalUs/dpuFlips:0),(unsigned long long)dpuWaitMaxUs);
+    }
+    static void dpuFenceFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->dpuFenceTick();}
+    void dpuFenceTick() {
+        if(dpuLock)IOLockLock(dpuLock);
+        if(!dpuFrame.valid) {if(dpuLock)IOLockUnlock(dpuLock);return;}
+        if(dpuGpuPending) {
+            // Offered to the scanout client and still unanswered: drop the frame (the previous one stays up) instead of
+            // scanning it unfenced.
+            ++dpuBusyFlips;
+            dpuGpuPending=false;dpuFrame.valid=false;dpuPendingSlot=-1;
+            if(dpuLock)IOLockUnlock(dpuLock);
+            return;
+        }
+        const bool idle=&native_gpu_idle?native_gpu_idle():true;
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-dpuFenceBegan,&ns);
+        if(!idle && ns<kDpuFenceDeadlineUs) {
+            if(dpuFenceTimer)dpuFenceTimer->setTimeoutUS(500);
+            if(dpuLock)IOLockUnlock(dpuLock);
+            return;
+        }
+        if(idle)++dpuIdleFlips; else ++dpuBusyFlips;
+        const DpuFrame frame=dpuFrame;
+        dpuFrame.valid=false;dpuPendingSlot=-1;
+        dpuFlipPrepared(frame.slot,frame.stride,frame.tenBit);
+        if(dpuLock)IOLockUnlock(dpuLock);
     }
 public:
     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
@@ -171,9 +335,33 @@ public:
         struct Args {NativeLegacyDisplay *display;int status;} args={this,status};
         IOWorkLoop *loop=getWorkLoop();
         auto action=[](OSObject *,void *a0,void *,void *,void *)->IOReturn {
-            Args *a=static_cast<Args *>(a0);a->display->finishGpuSwap(a->status);return kIOReturnSuccess;
+            Args *a=static_cast<Args *>(a0);a->display->completeDirect(a->status);return kIOReturnSuccess;
         };
-        if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
+        if(loop)loop->runAction(action,this,&args);else completeDirect(status);
+    }
+    // The scanout client's answer: the frame's GPU work is done, so the pipes can scan it. A failed or unanswered frame leaves
+    // the previous one on screen.
+    void completeDirect(int status) {
+        if(dpuLock)IOLockLock(dpuLock);
+        const bool pending=dpuGpuPending;dpuGpuPending=false;
+        if(pending) {
+            uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-dpuOfferBegan,&ns);
+            const uint64_t us=ns/1000;
+            dpuWaitTotalUs=dpuWaitTotalUs+us;
+            if(us>dpuWaitMaxUs)dpuWaitMaxUs=us;
+        }
+        if(pending && dpuFrame.valid) {
+            const DpuFrame frame=dpuFrame;
+            dpuFrame.valid=false;dpuPendingSlot=-1;
+            if(status==0) {
+                ++dpuIdleFlips;                 // fenced flips: the client waited for this frame's GPU work
+                if(dpuFenceTimer)dpuFenceTimer->cancelTimeout();
+                dpuShownSlot=frame.slot;        // protected before the writes, so a prepare cannot evict it
+                dpuFlipPrepared(frame.slot,frame.stride,frame.tenBit);
+            } else ++dpuBusyFlips;
+        }
+        if(dpuLock)IOLockUnlock(dpuLock);
+        finishGpuSwap(status);
     }
     // A transaction that updates only overlay layers carries no surface the family translates
     // (its per-layer IDs are 0 and the real overlays sit beyond the original 4-layer loop), and
@@ -219,11 +407,18 @@ public:
             uint64_t allocation=memory?native_legacy_surface_allocation(object):0;
             uint32_t format=object?native_legacy_surface_format(object):0,planes=object?native_legacy_surface_planes(object):0;
             PE_Video video={};
+            // The render server's two-plane 'b3a8' (RGB10A8_2P_XR10) frame keeps its colour words
+            // in plane 0, 4 bytes a texel at rows of 4*width bytes, and its alpha byte in plane 1
+            // past plane 0's last texel (the layout Metal's GPU reads, metal2vulkan's
+            // texture/surface_two_planes.rs); the record's stride field is plane 1's row here
+            // (width, 3,200). A composed display frame of that spelling is 5 bytes a texel, which
+            // is what the plain-BGRA bounds above cannot describe.
+            const bool twoPlane=format==0x62336138 && planes>=2;
+            const bool tenBit=twoPlane && memory && (uint64_t)width*height*5<=allocation && allocation<=memory->getLength();
             bool presentable=memory && memory->metaCast("IOMemoryDescriptor") &&
                 native_legacy_surface_width(object)>=width && native_legacy_surface_height(object)>=height &&
-                native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) &&
-                (format==0x42475241 || (format==0x26424741 && planes<=1) ||
-                 (format==0x62336138 && planes>=2)) &&
+                (twoPlane ? tenBit : native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength())) &&
+                (format==0x42475241 || (format==0x26424741 && planes<=1) || tenBit) &&
                 !PE_current_console(&video) && video.v_baseAddr==bootMapping->getPhysicalAddress() &&
                 video.v_width==width && video.v_height==height && video.v_depth==32 && !video.v_rotate &&
                 native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength());
@@ -232,25 +427,52 @@ public:
                     kind,object,(unsigned long long)(object?native_legacy_surface_width(object):0),(unsigned long long)(object?native_legacy_surface_height(object):0),
                     (unsigned long long)sourceStride,(unsigned long long)allocation,(unsigned)format,(unsigned)planes,memory,
                     (unsigned long long)(memory?memory->getLength():0),(int)presentable);
-            if(!presentable)break;
-            // Plain BGRA rows can be scanned in place: map the IOSurface pages into the display
-            // bank's stage-1 window and flip the live pipes to that IOVA (no CPU copy).
-            if((format==0x42475241 || (format==0x26424741 && planes<=1)) &&
-               dpuPresentBgra(object,memory,sourceStride,width,height,allocation)) {
-                ++baseCopies;
-                native_legacy_frame_observed(0,0,0,0,0,0);
-                native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
+            if(!presentable) {
+                ++dpuSkips;
+                if(skipLogged<8) {
+                    ++skipLogged;
+                    IOLog("UKE DPU: skip format=%08x planes=%u stride=%llu alloc=%llu bytes=%llu\n",(unsigned)format,(unsigned)planes,
+                        (unsigned long long)sourceStride,(unsigned long long)allocation,(unsigned long long)(memory?memory->getLength():0));
+                }
                 break;
             }
-            // The render server's own two-plane surface ('b3a8', RGB10A8_2P_XR10:
-            // one color word per texel in plane 0 and its alpha byte in plane 1,
-            // the layout metal2vulkan's surface_two_planes tests measured). The
-            // GPU hand-off and the copy helpers move plain rows, so this spelling
-            // decodes into the scanout here; the raw pages would be gibberish.
-            if(format==0x62336138 && planes>=2) {
+            // The compositor's surfaces are scanned in place: map the pages into the display bank's
+            // stage-1 window and flip the live pipes to that IOVA (no CPU copy, no GPU copy). The
+            // frame flipped is the previous one: SwapEnd runs before the GPU has necessarily
+            // finished writing the current surface, and scanning an in-flight surface is constant
+            // flicker. Both spellings travel the one path; the pipes' source format says which.
+            if(format==0x42475241 || (format==0x26424741 && planes<=1) || tenBit) {
+                const uint64_t stride=tenBit?(uint64_t)width*4:sourceStride;
+                if(dpuPrepareFrame(object,memory,stride,width,height,allocation,tenBit)) {
+                    ++baseCopies;
+                    // The scanout client is the only party that knows when this frame's GPU work finished (the compositor
+                    // submits the swap before that), so the frame is offered to it and the flip happens in its completion
+                    // (completeDirect). A refused offer keeps the display's own timing; the timer is the watchdog for a
+                    // client that goes away mid-frame.
+                    bool offered=native_legacy_gpu_offer(this,memory,stride,width,height);
+                    if(dpuLock)IOLockLock(dpuLock);
+                    dpuGpuPending=offered;dpuOfferBegan=mach_absolute_time();
+                    if(dpuLock)IOLockUnlock(dpuLock);
+                    if(dpuFenceTimer)dpuFenceTimer->setTimeoutUS(offered?uint32_t(kDpuOfferDeadlineUs):500);
+                    if(!offered && !dpuFenceTimer) {
+                        if(dpuLock)IOLockLock(dpuLock);
+                        const DpuFrame frame=dpuFrame;dpuFrame.valid=false;dpuPendingSlot=-1;
+                        dpuFlipPrepared(frame.slot,frame.stride,frame.tenBit);
+                        if(dpuLock)IOLockUnlock(dpuLock);
+                    }
+                    native_legacy_frame_observed(0,0,0,0,0,0);
+                    native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
+                    break;
+                }
+            }
+            // Fallback for the two-plane spelling when the direct path is not available (a board
+            // without the display bank's window): decode both planes into the scanout on the CPU.
+            // The raw pages would be gibberish, and the GPU hand-off and the copy helpers move
+            // plain rows.
+            if(twoPlane) {
                 uint64_t row0=(uint64_t)width*4,row1=width;
                 uint64_t base1=(uint64_t)width*height*4;
-                if(allocation>=base1+row1*height && sourceStride>=row0) {
+                if(allocation>=base1+row1*height) {
                     IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
                     uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
                     bool ok=source && source->getVirtualAddress() && source->getLength()>=allocation &&
@@ -272,7 +494,7 @@ public:
                     }
                     if(ok) {
                         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,(uint64_t)width*height*4);}
-                        ++baseCopies;
+                        ++baseCopies;++dpuFallbacks;
                         native_legacy_frame_observed(0,0,0,0,0,0);
                         native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
                     } else {
@@ -325,8 +547,65 @@ public:
         } while(false);
         baseBusy=0;
     }
-    void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    // ---- The refresh tick (ported from the upstream display, GopFramebuffer 33e941a) ----
+    bool vsyncWanted() const {
+        const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
+    }
+    void armVsync() {
+        if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
+        vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
+        vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
+    }
+    static void vsyncFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->vsyncTick();}
+    void vsyncTick() {
+        vsyncArmed=false;
+        if(!vsyncTimer)return;
+        if(!vsyncWanted()) {native_legacy_vsync_observed(2,vsyncHz);return;}
+        const uint64_t now=mach_absolute_time();
+        native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
+        native_legacy_vsync_observed(1,vsyncHz);
+        vsyncNext+=vsyncInterval;
+        if(vsyncNext<=now) {vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
+        vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
+    }
+    void startVsync() {
+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
+        IOWorkLoop *loop=getWorkLoop();
+        if(!loop)return;
+        IOTimerEventSource *timer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::vsyncFired);
+        if(!timer)return;
+        if(loop->addEventSource(timer)!=kIOReturnSuccess) {timer->release();return;}
+        nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
+        vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
+        loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
+            static_cast<NativeLegacyDisplay *>(owner)->armVsync();return kIOReturnSuccess;
+        },this);
+    }
+    void stopVsync() {
+        if(!vsyncTimer)return;
+        vsyncTimer->cancelTimeout();
+        if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
+        OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
+    }
+    // The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh, and the generic slot 301 fixes
+    // it at 1/60 s. With sheng-vsync=<Hz> it reports the panel's own rate instead; the maximum interval keeps the original value, or
+    // equals the minimum with sheng-vsync-fixed=1 (the panel has no variable refresh). Words in 32.32 s, then their mach times.
+    bool getRefreshAttributes(uint64_t *words,bool fixed) override {
+        if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(hz<=60 || hz>240)return true;
+        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        const uint64_t interval=(1ull<<32)/hz;
+        uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
+        words[0]=interval;words[1]=machTime;
+        if(fixed || locked==1){words[2]=interval;words[3]=machTime;}
+        native_legacy_vsync_observed(5,hz);
+        return true;
+    }
+    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
+        stopVsync();
         dpuStop();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
         if(logicalPM){PMstop();logicalPM=false;}
@@ -346,6 +625,7 @@ public:
         if(!IOMobileFramebufferLegacy::start(provider))return false;
         if(primary && bootMapping)announcePoweredByFirmware();
         if(primary && bootMapping)dpuStart();
+        startVsync();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
         unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
@@ -381,6 +661,10 @@ public:
     void registerService(IOOptionBits options=0) override {
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
+        // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps
+        // its own 1/60 s heartbeat. Publish it before any client can find the display, only when sheng-vsync asks for more.
+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
@@ -389,6 +673,7 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        armVsync();
         if(kicking){rekick=true;return;}
         kicking=true;
         do {

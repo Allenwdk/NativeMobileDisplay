@@ -2,7 +2,11 @@
 // Actual firmware scanout transfer, not a compositor or hardware vblank ABI.
 #pragma once
 #include <stdint.h>
-enum { NGP_BGRX8888=1,NGP_VERSION=1 };
+/* NGP_DIRECT is the mode word when the display processes the offered frame itself (the DPU direct path, uke-dpu-scanout>=3):
+ * the client writes nothing. It waits until the render server's GPU work on that frame has finished and then completes it,
+ * which is the fence the display flips on - the compositor submits a swap before its GPU work retires, so the display cannot
+ * know that moment by itself. Clients that do not know this mode refuse it, and the display keeps its own timing. */
+enum { NGP_BGRX8888=1,NGP_VERSION=1,NGP_DIRECT=0x44495243 /* 'DIRC' */ };
 struct NGPMode {uint32_t version,format;uint64_t width,height,stride,bytes;};
 struct NGPPresent {uint64_t address,bytes;uint32_t width,height,stride,format;};
 struct NGPTransfer {uint64_t sequence,bytes;};
