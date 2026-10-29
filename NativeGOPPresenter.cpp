@@ -99,12 +99,14 @@ bool NativeGOPPresenter::start(IOService *provider) {
     if(!mapping || !mapping->getVirtualAddress() || mapping->getPhysicalAddress()!=video.v_baseAddr ||
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
-    {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
+    // sheng-fb-gpu=1: the client copies each frame into this scanout (the display keeps scanning it). sheng-fb-gpu=2 selects that copy
+    // path explicitly even where the DPU direct path is on, so the two can be compared on one board.
+    unsigned gpuArg=0;PE_parse_boot_argn("sheng-fb-gpu",&gpuArg,sizeof gpuArg);gpuMode=(gpuArg==1 || gpuArg==2);
     // With the DPU direct path on, the display scans the offered surface itself and needs only the frame's GPU completion as its
     // fence: the mode word says so, and a client that does not know NGP_DIRECT refuses the mode, which leaves the display its own
     // timing. Otherwise the client copies the frame into this scanout as before.
     unsigned dpu=0;PE_parse_boot_argn("uke-dpu-scanout",&dpu,sizeof dpu);
-    const uint32_t scanoutMode=(gpuMode && dpu>=3)?NGP_DIRECT:NGP_BGRX8888;
+    const uint32_t scanoutMode=(gpuArg==1 && dpu>=3)?NGP_DIRECT:NGP_BGRX8888;
     mode={NGP_VERSION,scanoutMode,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;

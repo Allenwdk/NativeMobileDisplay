@@ -131,6 +131,13 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     IOLock *dpuLock=nullptr;
     uint64_t dpuFenceBegan=0;
     bool dpuGpuPending=false;   // the prepared frame was offered to the scanout client, which reports its GPU work done
+    // sheng-fb-gpu=2: the client copies the frame into the firmware's scanout instead of the pipes scanning the surface. The pipes
+    // then have to scan that memory again (dpuShowBoot), and the BGRA frames skip the direct path.
+    bool gpuCopyMode=false;
+    bool dpuBootShown=false;
+    // Copy mode is only useful while the client answers: if it never does, the pipes scan stale memory and the panel looks frozen,
+    // so the display goes back to scanning the compositor's surface itself (the direct path) after this many offers go unanswered.
+    uint32_t copyOffers=0,copyCompletes=0;
     static constexpr uint64_t kDpuFenceDeadlineUs=30000;
     // The scanout client's answer may take longer than a frame when the GPU is loaded (blur passes); waiting is smoother than
     // dropping the frame, which shows up as a skipped image in the middle of an animation.
@@ -199,6 +206,18 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         for(unsigned k=0;k<4;++k)dpuReleaseSlot(k);
         dpuShownSlot=-1;
         dpuOn=false;
+    }
+    // Put the pipes back on the firmware's own scanout (copy mode: the client's copy landed there). Register writes only.
+    void dpuShowBoot() {
+        if(!dpuOn || dpuBootShown)return;
+        mdp[(0x4000+0x14)/4]=dpuSavedSrc[0];mdp[(0x6000+0x14)/4]=dpuSavedSrc[1];
+        mdp[(0x4000+0x24)/4]=dpuSavedStride[0];mdp[(0x6000+0x24)/4]=dpuSavedStride[1];
+        mdp[(0x4000+0x30)/4]=dpuSavedFormat[0];mdp[(0x6000+0x30)/4]=dpuSavedFormat[1];
+        mdp[(0x4000+0x34)/4]=dpuSavedUnpack[0];mdp[(0x6000+0x34)/4]=dpuSavedUnpack[1];
+        __asm__ volatile("dsb sy":::"memory");
+        mdp[0x15018/4]=0x3;
+        __asm__ volatile("dsb sy":::"memory");
+        dpuBootShown=true;dpuShownSlot=-1;
     }
     // Maps the pages the pipes fetch, a prefix of the surface for the two-plane spelling (plane 0
     // alone: 27,340,800 bytes of a 32,601,344-byte frame, so the whole descriptor would not fit a
@@ -295,7 +314,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint64_t us=ns/1000;
         dpuLatchTotalUs=dpuLatchTotalUs+us;
         if(us>dpuLatchMaxUs)dpuLatchMaxUs=us;
-        dpuShownSlot=slot;
+        dpuShownSlot=slot;dpuBootShown=false;
         ++dpuFlips;if(tenBit)++dpuTenBitFlips;
         if((dpuFlips%120)==0)
             IOLog("UKE DPU: flip n=%llu tb=%llu skip=%llu fb=%llu latch=%lluus max=%lluus vsync=%u fence=%llu/%llu gpu=%lluus max=%lluus\n",
@@ -441,7 +460,7 @@ public:
             // frame flipped is the previous one: SwapEnd runs before the GPU has necessarily
             // finished writing the current surface, and scanning an in-flight surface is constant
             // flicker. Both spellings travel the one path; the pipes' source format says which.
-            if(format==0x42475241 || (format==0x26424741 && planes<=1) || tenBit) {
+            if((format==0x42475241 || (format==0x26424741 && planes<=1) || tenBit) && !(gpuCopyMode && !tenBit)) {
                 const uint64_t stride=tenBit?(uint64_t)width*4:sourceStride;
                 if(dpuPrepareFrame(object,memory,stride,width,height,allocation,tenBit)) {
                     ++baseCopies;
@@ -510,7 +529,25 @@ public:
             // copy. A refused offer (no client, or a frame still in flight)
             // falls back to the CPU copy below, exactly like kickOnce's
             // hand-off; the plugin's completion needs no request to retire.
+            if(gpuCopyMode) {
+                if(copyOffers>8 && copyCompletes==0) {
+                    gpuCopyMode=false;
+                    IOLog("UKE DPU: copy mode answered %u of %u offers, back to the direct path\n",copyCompletes,copyOffers);
+                }
+            }
+            if((!gpuCopyMode) && (format==0x42475241 || (format==0x26424741 && planes<=1) || tenBit)) {
+                // The copy path is off (or never answered): scan the surface here instead of leaving the panel on stale memory.
+                const uint64_t stride=tenBit?(uint64_t)width*4:sourceStride;
+                if(dpuPrepareFrame(object,memory,stride,width,height,allocation,tenBit)) {
+                    ++baseCopies;
+                    if(dpuFenceTimer)dpuFenceTimer->setTimeoutUS(500);
+                    native_legacy_frame_observed(0,0,0,0,0,0);
+                    native_legacy_transfer_observed(kIOReturnSuccess,nullptr,(uint64_t)width*height*4);
+                    break;
+                }
+            }
             if(native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+                ++copyOffers;
                 native_legacy_swap_stage(1);
                 ++baseCopies;
                 native_legacy_frame_observed(0,0,0,0,0,0);
@@ -624,6 +661,7 @@ public:
     bool start(IOService *provider) override {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
         if(primary && bootMapping)announcePoweredByFirmware();
+        {unsigned gpu=0;PE_parse_boot_argn("sheng-fb-gpu",&gpu,sizeof gpu);gpuCopyMode=(gpu==2);}
         if(primary && bootMapping)dpuStart();
         startVsync();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
@@ -816,6 +854,7 @@ public:
     }
     // The GPU client reported its copy (status 0) or lost it. Success retires the swap like a finished copy; anything else uses the CPU copy.
     void finishGpuSwap(int status) {
+        if(status==0) {++copyCompletes;if(gpuCopyMode)dpuShowBoot();}
         const OriginalLegacySwapRequest *request=gpuRequest;
         if(!request)return;
         gpuRequest=nullptr;
