@@ -154,7 +154,6 @@ extern "C" void native_legacy_direct_snapshot(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
-    uint32_t scanBudget=32;
     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
     bool primary=false;
     bool logicalPM=false;
@@ -337,7 +336,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // A provider's failed query is not completion. Poll without blocking the display work loop;
     // a slow GPU leaves the previous frame on screen until completion or family cancellation.
     bool traceGpuComplete=false;
-    unsigned tracePixels=0;uint64_t tracePixelAt=0;
     bool gpuWrote(const OriginalLegacySwapRequest *request) {
         traceGpuComplete=false;
         if(fenceFor!=request) {
@@ -391,50 +389,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         native_legacy_direct[5]=native_legacy_direct[5]+us;
         shownSlot=pendingSlot;pendingSlot=-1;
         stat(10);note(5,shownSlot,latchRequest);
-        captureDisplay(latchRequest,!(mdp[kCtlFlush/4]&0x3));
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
         finishTransfer(request,true);
-    }
-    void captureDisplay(const OriginalLegacySwapRequest *request,bool latched,bool copied=false) {
-        const uint64_t requestId=copied?gpuTraceRequest:traceId(request);
-        if(!&native_gpu_trace_enabled || !native_gpu_trace_enabled() || !&native_gpu_pixel_put)return;
-        const uint64_t now=nowUs();
-        if(tracePixels>=3 || (tracePixelAt && now-tracePixelAt<30000000))return;
-        if((!copied && (!traceGpuComplete || shownSlot<0)) || !latched) {
-            gpuTraceEvent(GpuTraceDisplayPixel,0,requestId,-5,0,0,0,0,traceGpuComplete,latched);return;
-        }
-        OSObject *surface=copied?nullptr:directSlots[shownSlot].surface;
-        IOMemoryDescriptor *memory=copied?(bootMapping?bootMapping->getMemoryDescriptor():nullptr):directSlots[shownSlot].memory;
-        PE_Video video{};if(copied && PE_current_console(&video))return;
-        if(!memory || (!copied && !surface))return;
-        const uint32_t width=copied?video.v_width:native_legacy_surface_width(surface),height=copied?video.v_height:native_legacy_surface_height(surface);
-        const uint32_t format=copied?0x42475241:native_legacy_surface_format(surface),stride=copied?video.v_rowBytes:native_legacy_surface_stride(surface);
-        // Direct scanout accepts these four-byte formats. Other layouts remain metadata-only.
-        if(!width || !height || width>16384 || stride<uint64_t(width)*4 ||
-           uint64_t(stride)*height>memory->getLength())return;
-        const uint32_t gw=width<64?width:64,gh=height<64?height:64,bytes=gw*gh*4;
-        auto *data=static_cast<uint8_t *>(IOMalloc(bytes));
-        auto *row=static_cast<uint8_t *>(IOMalloc(uint64_t(width)*4));
-        if(!data || !row){if(data)IOFree(data,bytes);if(row)IOFree(row,uint64_t(width)*4);return;}
-        bool ok=true;
-        for(uint32_t y=0;y<gh && ok;++y) {
-            const uint64_t off=uint64_t(y)*height/gh*stride;
-            ok=memory->readBytes(off,row,uint64_t(width)*4)==uint64_t(width)*4;
-            for(uint32_t x=0;ok && x<gw;++x)memcpy(data+(y*gw+x)*4,row+uint64_t(x)*width/gw*4,4);
-        }
-        NativeGpuPixelPiece piece{};auto &h=piece.header;
-        h.magic=0x31585047;h.version=1;h.stage=3;h.capture=requestId;h.command=h.capture;
-        h.us=now;h.physical=copied?bootMapping->getPhysicalAddress():directSlots[shownSlot].physical;
-        h.width=width;h.height=height;h.format=format;h.source_stride=stride;
-        h.grid_width=gw;h.grid_height=gh;h.row_bytes=gw*4;h.bytes_per_pixel=4;h.bytes=bytes;h.flags=3|(copied?16:0);h.fence=copied?0:fenceTarget;
-        int result=ok?0:-2;
-        for(uint32_t at=0;at<bytes && !result;at+=piece.bytes) {
-            piece.offset=at;piece.bytes=bytes-at<NativeGpuPixelChunk?bytes-at:NativeGpuPixelChunk;
-            memcpy(piece.data,data+at,piece.bytes);result=native_gpu_pixel_put(&piece,0);
-        }
-        gpuTraceEvent(GpuTraceDisplayPixel,0,h.capture,result,h.physical,format,bytes,fenceTarget);
-        if(!result)++tracePixels;
-        tracePixelAt=now;IOFree(data,bytes);IOFree(row,uint64_t(width)*4);
     }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
     void directToBoot() {
@@ -728,16 +684,6 @@ public:
             source->getLength(),sourceStride,width,height)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
-        // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
-        if(scanBudget) {
-            --scanBudget;
-            uint64_t scan[5];
-            if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
-                native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);
-            uint32_t colors[4];uint64_t counts[4],other=0;
-            if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
-                native_legacy_frame_colors_observed(colors,counts,other);
-        }
         if(!native_legacy_prepare_scanout()) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
@@ -778,8 +724,6 @@ public:
         const OriginalLegacySwapRequest *request=gpuRequest;
         if(!request)return;
         gpuRequest=nullptr;
-        gpuTraceEvent(GpuTraceDisplayPixel,0,gpuTraceRequest,status,0,0,0,0,1,1);
-        if(status==0)captureDisplay(request,true,true);
         if(gpuRetired) {
             // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
             // (the next one takes the CPU copy).
