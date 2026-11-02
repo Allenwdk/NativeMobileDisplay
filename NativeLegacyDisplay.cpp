@@ -51,7 +51,7 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // (NativeUfs native_ufs_dpu_map). [0] flips, [1] surfaces mapped, [2] map failures, [3] latches that took over 50 ms, [4] longest latch (us),
 // [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory,
 // [9] swaps held back until the GPU had written the frame (the compositor submits the swap when the command buffer is scheduled), [10] total
-// and [11] longest wait (us), [12] waits that gave up after 250 ms, [13] waits of 8 ms or more (longer than a refresh at 120 Hz: the frame missed a flip).
+// and [11] longest wait (us), [12] waits that reached 250 ms, [13] waits of 8 ms or more (longer than a refresh at 120 Hz: the frame missed a flip).
 extern "C" {volatile uint32_t native_legacy_direct[14];}
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired) __attribute__((weak_import));
 extern "C" bool native_adreno_fences_detail(uint32_t *,uint32_t *,uint32_t *) __attribute__((weak_import));
@@ -258,10 +258,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t latchStart=0,directClock=0;
     int shownSlot=-1,pendingSlot=-1;
     uint32_t shownStride=0;
-    // The flip waits for the GPU: fenceFor is the request it waits for, fenceTarget the newest fence handed out when it arrived.
+    // Keep the first successful fence snapshot for this request across pending and busy polls.
     const OriginalLegacySwapRequest *fenceFor=nullptr;
     uint32_t fenceTarget=0;
     uint64_t fenceSince=0;
+    bool fenceCaptured=false,fenceSlow=false;
     IOTimerEventSource *fenceTimer=nullptr;
     bool directOn=false,directBoot=true;
     static constexpr uint32_t kVig[2]={0x4000,0x6000},kCtlFlush=0x15018,kBootIova=0xb8000000U,kBootStride=0x2fa0;
@@ -333,21 +334,26 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
     }
-    // True once the GPU wrote everything handed to it before this request arrived (or gave up after 250 ms); otherwise arms the poll.
+    // A provider's failed query is not completion. Poll without blocking the display work loop;
+    // a slow GPU leaves the previous frame on screen until completion or family cancellation.
     bool traceGpuComplete=false;
     unsigned tracePixels=0;uint64_t tracePixelAt=0;
     bool gpuWrote(const OriginalLegacySwapRequest *request) {
         traceGpuComplete=false;
+        if(fenceFor!=request) {
+            fenceFor=request;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;
+        }
         uint32_t submitted=0,retired=0,detail[3]={0,0,4};
+        // Preserve the CPU-only backend when no GPU fence interface is linked.
+        if(!&native_adreno_fences_detail && !&native_adreno_fences) {
+            gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),0,0,0,0,0,0,0,4);return true;
+        }
         const bool known=&native_adreno_fences_detail?native_adreno_fences_detail(&submitted,&retired,detail):
             (&native_adreno_fences && native_adreno_fences(&submitted,&retired));
-        if(!known) {
-            gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),0,fenceFor==request?fenceTarget:0,0,0,0,detail[0],detail[1],detail[2]);return true;
+        if(known && !fenceCaptured) {
+            fenceTarget=submitted;fenceCaptured=true;
         }
-        if(fenceFor!=request) {
-            fenceFor=request;fenceTarget=submitted;fenceSince=0;
-        }
-        if(int32_t(retired-fenceTarget)>=0) {
+        if(known && int32_t(retired-fenceTarget)>=0) {
             traceGpuComplete=true;
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),1,fenceTarget,submitted,retired,0,detail[0],detail[1],detail[2]);
             if(fenceSince)note(3,-1,request);
@@ -362,12 +368,12 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         if(!fenceSince) {fenceSince=mach_absolute_time();native_legacy_direct[9]=native_legacy_direct[9]+1;stat(6);note(2,-1,request);}
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceSince,&ns);
-        if(ns>=250000000ull) {
+        if(ns>=250000000ull && !fenceSlow) {
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),2,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
             native_legacy_direct[12]=native_legacy_direct[12]+1;
-            fenceFor=nullptr;return true;
+            fenceSlow=true;
         }
-        gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),3,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
+        gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),known?3:4,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
         fenceTimer->setTimeoutUS(200);
         return false;
     }
@@ -819,6 +825,8 @@ public:
     // frame is not held behind the cancelled one. The family only logs the result; the slot used to be a guard that panicked.
     bool cancelSwapsAfterTimeout() override {
         native_legacy_swap_timeouts=native_legacy_swap_timeouts+1;
+        if(fenceTimer)fenceTimer->cancelTimeout();
+        fenceFor=nullptr;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;
         for(auto &entry: validated)entry=nullptr;
         gpuRequest=nullptr;gpuRetired=false;transferred=false;
         return true;
