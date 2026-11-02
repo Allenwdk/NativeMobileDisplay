@@ -181,10 +181,12 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             OSObject *surface=nullptr;
             if(request)memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+kRequestSurfaces,sizeof(surface));
             IOMemoryDescriptor *memory=surface?native_legacy_surface_descriptor(surface):nullptr;
-            IOByteCount length=0;const uint64_t physical=memory?memory->getPhysicalSegment(0,&length,kIOMemoryMapperNone):0;
+            uint64_t physical=0;
+            // Validation precedes prepare(). Only a retained direct slot owns wired pages.
+            for(const auto &wired:directSlots)if(wired.surface==surface && wired.memory==memory){physical=wired.physical;break;}
             gpuTraceEvent(GpuTraceDisplay,0,traceId(request),event,uint64_t(uintptr_t(request)),uint64_t(uintptr_t(surface)),physical,
                           slot,shownSlot,pendingSlot,validatedCount());
-            if(surface && event==1)gpuTraceEvent(GpuTraceDisplaySurface,0,traceId(request),physical,native_legacy_surface_width(surface),
+            if(surface && (event==1 || event==4))gpuTraceEvent(GpuTraceDisplaySurface,0,traceId(request),physical,native_legacy_surface_width(surface),
                 native_legacy_surface_height(surface),native_legacy_surface_stride(surface),native_legacy_surface_format(surface),
                 native_legacy_surface_allocation(surface),memory?memory->getLength():0);
         }
@@ -245,7 +247,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // Direct scanout state, used on the work loop only. DPU 9.2 inside the MDP block (0xae01000): VIG 0 and 1 at 0x4000 and 0x6000 (source
     // address 0 at +0x14, stride 0 at +0x24; VIG 1 takes the right half through its own source x), CTL 0 at 0x15000 (flush at +0x18, VIG 0
     // and 1 are bits 0 and 1). i562: a flush of the two pipes latched within 5.4 ms with no start (the panel refreshes by itself).
-    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used;};
+    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used,physical;};
     static constexpr unsigned kDirectSlots=4;
     DirectSlot directSlots[kDirectSlots]={};
     IOMemoryMap *mdpMap=nullptr;
@@ -327,7 +329,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint32_t iova=ok?native_ufs_dpu_map(unsigned(pick),directPages,count):0;
         if(!iova){memory->complete();native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
         surface->retain();memory->retain();
-        slot={surface,memory,iova,directClock};
+        slot={surface,memory,iova,directClock,directPages[0]};
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
     }
@@ -415,8 +417,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             for(uint32_t x=0;ok && x<gw;++x)memcpy(data+(y*gw+x)*4,row+uint64_t(x)*width/gw*4,4);
         }
         NativeGpuPixelPiece piece{};auto &h=piece.header;
-        IOByteCount span=0;h.magic=0x31585047;h.version=1;h.stage=3;h.capture=requestId;h.command=h.capture;
-        h.us=now;h.physical=memory->getPhysicalSegment(0,&span,kIOMemoryMapperNone);
+        h.magic=0x31585047;h.version=1;h.stage=3;h.capture=requestId;h.command=h.capture;
+        h.us=now;h.physical=copied?bootMapping->getPhysicalAddress():directSlots[shownSlot].physical;
         h.width=width;h.height=height;h.format=format;h.source_stride=stride;
         h.grid_width=gw;h.grid_height=gh;h.row_bytes=gw*4;h.bytes_per_pixel=4;h.bytes=bytes;h.flags=3|(copied?16:0);h.fence=copied?0:fenceTarget;
         int result=ok?0:-2;
