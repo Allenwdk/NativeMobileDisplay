@@ -1,3 +1,5 @@
+#define NATIVE_GPU_TRACE_OPTIONAL
+#include "NativeGpuTrace.h"
 #include "NativeLegacyRequest.h"
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Reuse the unchanged original generic framebuffer implementation. Unknown
@@ -49,9 +51,10 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // (NativeUfs native_ufs_dpu_map). [0] flips, [1] surfaces mapped, [2] map failures, [3] latches that took over 50 ms, [4] longest latch (us),
 // [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory,
 // [9] swaps held back until the GPU had written the frame (the compositor submits the swap when the command buffer is scheduled), [10] total
-// and [11] longest wait (us), [12] waits that gave up after 250 ms, [13] waits of 8 ms or more (longer than a refresh at 120 Hz: the frame missed a flip).
+// and [11] longest wait (us), [12] waits that reached 250 ms, [13] waits of 8 ms or more (longer than a refresh at 120 Hz: the frame missed a flip).
 extern "C" {volatile uint32_t native_legacy_direct[14];}
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired) __attribute__((weak_import));
+extern "C" bool native_adreno_fences_detail(uint32_t *,uint32_t *,uint32_t *) __attribute__((weak_import));
 // The swap lifecycle: native_legacy_ring holds the newest native_legacy_ring_cap events (allocated at start: a static array of this size no longer fits the kernel's data segment), {[0] microseconds since boot (64 bit), [1] event << 56 | slot + 1 << 48 |
 // swaps validated and not retired << 40 | GPU fences outstanding << 24 | the request's tag (24 bits)}. Events: 1 swap validated, 2 fence wait
 // begun, 3 fence passed, 4 flipped to a slot, 5 latched, 6 retired, 7 offered to the GPU copy, 8 blank frame. native_legacy_snap is the 64
@@ -165,12 +168,28 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         for(auto entry: validated)if(entry==request)return true;
         return false;
     }
-    void removeValidated(const OriginalLegacySwapRequest *request) {for(unsigned i=0;i<8;++i)if(validated[i]==request){validated[i]=nullptr;validatedAt[i]=0;}}
+    void removeValidated(const OriginalLegacySwapRequest *request) {for(unsigned i=0;i<8;++i)if(validated[i]==request){validated[i]=nullptr;validatedAt[i]=0;traceRequestIds[i]=0;}}
+    uint64_t traceRequestIds[8];
+    uint64_t traceNextRequest=0;
+    uint64_t traceId(const OriginalLegacySwapRequest *r) {for(unsigned i=0;i<8;++i)if(validated[i]==r){if(!traceRequestIds[i])traceRequestIds[i]=++traceNextRequest;return traceRequestIds[i];}return 0;}
     uint64_t validatedAt[8];   // no initializer: IOKit objects are allocated zeroed, and a member memset would push the constructor's call to the original C2 out of the binding check's window
     static uint64_t nowUs() {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
     unsigned validatedCount() const {unsigned n=0;for(auto entry: validated)if(entry)++n;return n;}
     void stat(unsigned index) {native_legacy_swapstat[index]=native_legacy_swapstat[index]+1;}
     void note(unsigned event,int slot,const OriginalLegacySwapRequest *request) {
+        if(&native_gpu_trace_enabled && native_gpu_trace_enabled()) {
+            OSObject *surface=nullptr;
+            if(request)memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+kRequestSurfaces,sizeof(surface));
+            IOMemoryDescriptor *memory=surface?native_legacy_surface_descriptor(surface):nullptr;
+            uint64_t physical=0;
+            // Validation precedes prepare(). Only a retained direct slot owns wired pages.
+            for(const auto &wired:directSlots)if(wired.surface==surface && wired.memory==memory){physical=wired.physical;break;}
+            gpuTraceEvent(GpuTraceDisplay,0,traceId(request),event,uint64_t(uintptr_t(request)),uint64_t(uintptr_t(surface)),physical,
+                          slot,shownSlot,pendingSlot,validatedCount());
+            if(surface && (event==1 || event==4))gpuTraceEvent(GpuTraceDisplaySurface,0,traceId(request),physical,native_legacy_surface_width(surface),
+                native_legacy_surface_height(surface),native_legacy_surface_stride(surface),native_legacy_surface_format(surface),
+                native_legacy_surface_allocation(surface),memory?memory->getLength():0);
+        }
         uint32_t submitted=0,retired=0;uint32_t outstanding=0;
         if(&native_adreno_fences && native_adreno_fences(&submitted,&retired)){const int32_t d=int32_t(submitted-retired);outstanding=d>0?(d>255?255:uint32_t(d)):0;}
         if(!native_legacy_ring_cap)return;
@@ -207,6 +226,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         validated[0]=request;validatedAt[0]=nowUs();
     }
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
+    uint64_t gpuTraceRequest=0;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
     // The swap of the frame the GPU client is copying already retired (boot-arg sheng-early-retire, default 1). Retiring the offered
@@ -227,7 +247,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // Direct scanout state, used on the work loop only. DPU 9.2 inside the MDP block (0xae01000): VIG 0 and 1 at 0x4000 and 0x6000 (source
     // address 0 at +0x14, stride 0 at +0x24; VIG 1 takes the right half through its own source x), CTL 0 at 0x15000 (flush at +0x18, VIG 0
     // and 1 are bits 0 and 1). i562: a flush of the two pipes latched within 5.4 ms with no start (the panel refreshes by itself).
-    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used;};
+    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used,physical;};
     static constexpr unsigned kDirectSlots=4;
     DirectSlot directSlots[kDirectSlots]={};
     IOMemoryMap *mdpMap=nullptr;
@@ -238,10 +258,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t latchStart=0,directClock=0;
     int shownSlot=-1,pendingSlot=-1;
     uint32_t shownStride=0;
-    // The flip waits for the GPU: fenceFor is the request it waits for, fenceTarget the newest fence handed out when it arrived.
+    // Keep the first successful fence snapshot for this request across pending and busy polls.
     const OriginalLegacySwapRequest *fenceFor=nullptr;
     uint32_t fenceTarget=0;
     uint64_t fenceSince=0;
+    bool fenceCaptured=false,fenceSlow=false;
     IOTimerEventSource *fenceTimer=nullptr;
     bool directOn=false,directBoot=true;
     static constexpr uint32_t kVig[2]={0x4000,0x6000},kCtlFlush=0x15018,kBootIova=0xb8000000U,kBootStride=0x2fa0;
@@ -309,18 +330,32 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint32_t iova=ok?native_ufs_dpu_map(unsigned(pick),directPages,count):0;
         if(!iova){memory->complete();native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
         surface->retain();memory->retain();
-        slot={surface,memory,iova,directClock};
+        slot={surface,memory,iova,directClock,directPages[0]};
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
     }
-    // True once the GPU wrote everything handed to it before this request arrived (or gave up after 250 ms); otherwise arms the poll.
+    // A provider's failed query is not completion. Poll without blocking the display work loop;
+    // a slow GPU leaves the previous frame on screen until completion or family cancellation.
+    bool traceGpuComplete=false;
+    unsigned tracePixels=0;uint64_t tracePixelAt=0;
     bool gpuWrote(const OriginalLegacySwapRequest *request) {
-        uint32_t submitted=0,retired=0;
-        if(!&native_adreno_fences || !native_adreno_fences(&submitted,&retired))return true;
+        traceGpuComplete=false;
         if(fenceFor!=request) {
-            fenceFor=request;fenceTarget=submitted;fenceSince=0;
+            fenceFor=request;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;
         }
-        if(int32_t(retired-fenceTarget)>=0) {
+        uint32_t submitted=0,retired=0,detail[3]={0,0,4};
+        // Preserve the CPU-only backend when no GPU fence interface is linked.
+        if(!&native_adreno_fences_detail && !&native_adreno_fences) {
+            gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),0,0,0,0,0,0,0,4);return true;
+        }
+        const bool known=&native_adreno_fences_detail?native_adreno_fences_detail(&submitted,&retired,detail):
+            (&native_adreno_fences && native_adreno_fences(&submitted,&retired));
+        if(known && !fenceCaptured) {
+            fenceTarget=submitted;fenceCaptured=true;
+        }
+        if(known && int32_t(retired-fenceTarget)>=0) {
+            traceGpuComplete=true;
+            gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),1,fenceTarget,submitted,retired,0,detail[0],detail[1],detail[2]);
             if(fenceSince)note(3,-1,request);
             if(fenceSince) {
                 uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceSince,&ns);
@@ -333,10 +368,12 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         if(!fenceSince) {fenceSince=mach_absolute_time();native_legacy_direct[9]=native_legacy_direct[9]+1;stat(6);note(2,-1,request);}
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceSince,&ns);
-        if(ns>=250000000ull) {
+        if(ns>=250000000ull && !fenceSlow) {
+            gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),2,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
             native_legacy_direct[12]=native_legacy_direct[12]+1;
-            fenceFor=nullptr;return true;
+            fenceSlow=true;
         }
+        gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),known?3:4,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
         fenceTimer->setTimeoutUS(200);
         return false;
     }
@@ -346,6 +383,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void latchTick() {
         if(!latchRequest)return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
+        gpuTraceEvent(GpuTraceDisplayLatch,0,traceId(latchRequest),mdp[kCtlFlush/4],ns,shownSlot,pendingSlot);
         if((mdp[kCtlFlush/4]&0x3) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
         if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
         const uint32_t us=uint32_t(ns/1000);
@@ -353,8 +391,50 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         native_legacy_direct[5]=native_legacy_direct[5]+us;
         shownSlot=pendingSlot;pendingSlot=-1;
         stat(10);note(5,shownSlot,latchRequest);
+        captureDisplay(latchRequest,!(mdp[kCtlFlush/4]&0x3));
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
         finishTransfer(request,true);
+    }
+    void captureDisplay(const OriginalLegacySwapRequest *request,bool latched,bool copied=false) {
+        const uint64_t requestId=copied?gpuTraceRequest:traceId(request);
+        if(!&native_gpu_trace_enabled || !native_gpu_trace_enabled() || !&native_gpu_pixel_put)return;
+        const uint64_t now=nowUs();
+        if(tracePixels>=3 || (tracePixelAt && now-tracePixelAt<30000000))return;
+        if((!copied && (!traceGpuComplete || shownSlot<0)) || !latched) {
+            gpuTraceEvent(GpuTraceDisplayPixel,0,requestId,-5,0,0,0,0,traceGpuComplete,latched);return;
+        }
+        OSObject *surface=copied?nullptr:directSlots[shownSlot].surface;
+        IOMemoryDescriptor *memory=copied?(bootMapping?bootMapping->getMemoryDescriptor():nullptr):directSlots[shownSlot].memory;
+        PE_Video video{};if(copied && PE_current_console(&video))return;
+        if(!memory || (!copied && !surface))return;
+        const uint32_t width=copied?video.v_width:native_legacy_surface_width(surface),height=copied?video.v_height:native_legacy_surface_height(surface);
+        const uint32_t format=copied?0x42475241:native_legacy_surface_format(surface),stride=copied?video.v_rowBytes:native_legacy_surface_stride(surface);
+        // Direct scanout accepts these four-byte formats. Other layouts remain metadata-only.
+        if(!width || !height || width>16384 || stride<uint64_t(width)*4 ||
+           uint64_t(stride)*height>memory->getLength())return;
+        const uint32_t gw=width<64?width:64,gh=height<64?height:64,bytes=gw*gh*4;
+        auto *data=static_cast<uint8_t *>(IOMalloc(bytes));
+        auto *row=static_cast<uint8_t *>(IOMalloc(uint64_t(width)*4));
+        if(!data || !row){if(data)IOFree(data,bytes);if(row)IOFree(row,uint64_t(width)*4);return;}
+        bool ok=true;
+        for(uint32_t y=0;y<gh && ok;++y) {
+            const uint64_t off=uint64_t(y)*height/gh*stride;
+            ok=memory->readBytes(off,row,uint64_t(width)*4)==uint64_t(width)*4;
+            for(uint32_t x=0;ok && x<gw;++x)memcpy(data+(y*gw+x)*4,row+uint64_t(x)*width/gw*4,4);
+        }
+        NativeGpuPixelPiece piece{};auto &h=piece.header;
+        h.magic=0x31585047;h.version=1;h.stage=3;h.capture=requestId;h.command=h.capture;
+        h.us=now;h.physical=copied?bootMapping->getPhysicalAddress():directSlots[shownSlot].physical;
+        h.width=width;h.height=height;h.format=format;h.source_stride=stride;
+        h.grid_width=gw;h.grid_height=gh;h.row_bytes=gw*4;h.bytes_per_pixel=4;h.bytes=bytes;h.flags=3|(copied?16:0);h.fence=copied?0:fenceTarget;
+        int result=ok?0:-2;
+        for(uint32_t at=0;at<bytes && !result;at+=piece.bytes) {
+            piece.offset=at;piece.bytes=bytes-at<NativeGpuPixelChunk?bytes-at:NativeGpuPixelChunk;
+            memcpy(piece.data,data+at,piece.bytes);result=native_gpu_pixel_put(&piece,0);
+        }
+        gpuTraceEvent(GpuTraceDisplayPixel,0,h.capture,result,h.physical,format,bytes,fenceTarget);
+        if(!result)++tracePixels;
+        tracePixelAt=now;IOFree(data,bytes);IOFree(row,uint64_t(width)*4);
     }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
     void directToBoot() {
@@ -611,7 +691,7 @@ public:
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,half?halfOfferFormat():NGP_BGRX8888)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
-            shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+            shadowValid=false;gpuRequest=request;gpuTraceRequest=traceId(request);gpuLength=length;transferred=true;
             // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy serialized render and
             // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
             // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
@@ -698,6 +778,8 @@ public:
         const OriginalLegacySwapRequest *request=gpuRequest;
         if(!request)return;
         gpuRequest=nullptr;
+        gpuTraceEvent(GpuTraceDisplayPixel,0,gpuTraceRequest,status,0,0,0,0,1,1);
+        if(status==0)captureDisplay(request,true,true);
         if(gpuRetired) {
             // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
             // (the next one takes the CPU copy).
@@ -743,6 +825,8 @@ public:
     // frame is not held behind the cancelled one. The family only logs the result; the slot used to be a guard that panicked.
     bool cancelSwapsAfterTimeout() override {
         native_legacy_swap_timeouts=native_legacy_swap_timeouts+1;
+        if(fenceTimer)fenceTimer->cancelTimeout();
+        fenceFor=nullptr;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;
         for(auto &entry: validated)entry=nullptr;
         gpuRequest=nullptr;gpuRetired=false;transferred=false;
         return true;
