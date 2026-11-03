@@ -15,3 +15,8 @@ Build and interface details: [documentation](https://unixnu.com/drivers/gop-fram
 `sheng-gpu-trace=1` records display arrival, fence and latch in the kernel GPU ring. Repeated pending display queries are coalesced. See [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics) for fields and decoding.
 
 Display traces obtain physical addresses from prepared direct-display slots. Validation records use address zero until a slot is mapped; the flip record supplies the mapped address. Observers do not prepare memory or query unwired descriptors.
+
+
+## Uke 24A446 integration (2026-11-03)
+
+The requested-scanout initialization correction and upstream fence/cancellation lifecycle are included in the user-accepted uke GPU baseline (kernel CRC `90B6BC701210D9DB`). Boot, icon/widget loading and Settings/Dock transitions are reported working after the corresponding Metal library fix. No isolated display-throughput or long-run timing result is inferred.
