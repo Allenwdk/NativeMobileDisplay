@@ -468,6 +468,15 @@ public:
     // original state setter (the virtual the original code calls with this same request shape) with only the powered word named.
     void announcePoweredByFirmware() {
         OriginalLegacyStateRequest request={1,0,0,1,1,{}};
+#if defined(NATIVE_LEGACY_BOOT_SCANOUT_REQUESTED) && NATIVE_LEGACY_BOOT_SCANOUT_REQUESTED
+        // The qualified 24A446 family also gates swap submission on its
+        // requested state. The primary GOP mapping is already validated and
+        // usable here: publish that initial logical scanout request through
+        // the original setter, alongside the firmware-powered state. This
+        // does not implement a panel power transition or change IPC results.
+        request.skipRequested=0;
+        request.requested=1;
+#endif
         applyStateRequest(&request,false);
     }
     bool start(IOService *provider) override {
